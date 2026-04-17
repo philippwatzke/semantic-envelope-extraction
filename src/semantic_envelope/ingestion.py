@@ -32,6 +32,8 @@ def parse_odometry(csv_path: Path | str) -> dict[int, tuple[np.ndarray, np.ndarr
     with Path(csv_path).open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # Strip whitespace from keys to handle CSV files with spaces after commas
+            row = {k.strip(): v for k, v in row.items()}
             frame_id = int(row["frame"])
             pose = quaternion_to_pose_matrix(
                 tx=float(row["x"]), ty=float(row["y"]), tz=float(row["z"]),

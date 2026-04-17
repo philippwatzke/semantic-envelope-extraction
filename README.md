@@ -17,3 +17,16 @@ pip install -e .
 ```bash
 python extract.py --input data/stray_scanner/228fb53d88.zip --output outputs/228fb53d88/
 ```
+
+## Testen
+
+```bash
+# Unit-Tests (schnell, CPU-only)
+pytest -m "not gpu and not slow"
+
+# Smoke-Test (braucht CUDA + Modell-Downloads)
+pytest -m gpu tests/test_smoke.py -v -s
+```
+
+Bei Visual-Regression: `outputs/*/facade.png` mit Referenz-Screenshots in
+`docs/` vergleichen.
