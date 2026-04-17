@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import tempfile
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
@@ -127,6 +127,9 @@ class WallCloudAccumulator:
         self._frames = 0
         self._spill_bytes = spill_bytes
         self._spill_frame_count = spill_frame_count
+        # Merke, ob wir den tmp_dir selbst erzeugt haben — nur dann löschen wir
+        # ihn in cleanup(), um vom Aufrufer gestellte Verzeichnisse zu schützen.
+        self._owns_tmp_dir = tmp_dir is None
         self._tmp_dir = Path(tmp_dir) if tmp_dir else Path(tempfile.mkdtemp(
             prefix="wallcloud_"))
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -154,6 +157,12 @@ class WallCloudAccumulator:
         self._frames = 0
 
     def finalize(self) -> np.ndarray:
+        """Sammle alle In-RAM-Arrays plus gespillte Chunks zu einer Nx3-Wolke.
+
+        **Destruktiv:** Leert intern die In-RAM-Liste. Ein zweiter Aufruf von
+        ``finalize()`` gibt nur noch die (wieder geladenen) Spill-Dateien zurück
+        oder ``(0, 3)`` wenn keine existieren. Nicht zweimal aufrufen.
+        """
         chunks = []
         if self._spill_files:
             for p in self._spill_files:
@@ -166,6 +175,9 @@ class WallCloudAccumulator:
         return np.concatenate(chunks, axis=0)
 
     def cleanup(self) -> None:
+        """Lösche Spill-Dateien und (falls selbst erzeugt) das tmp-Verzeichnis."""
         for p in self._spill_files:
             p.unlink(missing_ok=True)
         self._spill_files.clear()
+        if self._owns_tmp_dir and self._tmp_dir.exists():
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
