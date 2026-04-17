@@ -14,8 +14,8 @@ transformers>=4.41             # Grounding DINO via AutoModelForZeroShotObjectDe
 # SAM 2: aus GitHub installieren (siehe README)
 # pip install "git+https://github.com/facebookresearch/sam2.git"
 
-# 3D / Visualisierung
-open3d>=0.18
+# 3D / Visualisierung — open3d war im Spec als Option, wird aber nicht genutzt
+# (render_pointcloud_png nutzt matplotlib 3D-scatter, spart ~500 MB install)
 matplotlib>=3.8
 
 # Test-Framework

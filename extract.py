@@ -113,10 +113,10 @@ def main(argv: list[str] | None = None) -> int:
             all_rings.extend(rings)
             all_poses.append(frame.pose_4x4)
     finally:
+        # VRAM + Disk-Spills auch bei Exceptions freigeben
         segmenter.unload()
-
-    wall_cloud = wall_acc.finalize()
-    wall_acc.cleanup()
+        wall_cloud = wall_acc.finalize()
+        wall_acc.cleanup()
     log.info("Phase 1 fertig: wall_cloud=%d Punkte, rings=%d Instanzen",
              len(wall_cloud), len(all_rings))
     if len(wall_cloud) < 1000:
@@ -178,13 +178,15 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = args.output / "results.csv"
     write_csv(windows, csv_path)
 
-    # Projektion der Ringe nach Klasse für 3D-Plot
-    rings_by_class: dict[str, np.ndarray] = {}
+    # Projektion der Ringe nach Klasse für 3D-Plot — listenbasiert akkumulieren
+    # (vermeidet O(n²) Kopien bei vielen Instanzen), dann einmaliges Concat
+    rings_by_class_buckets: dict[str, list[np.ndarray]] = {}
     for r in all_rings:
-        rings_by_class.setdefault(r.klasse,
-                                  np.zeros((0, 3), dtype=np.float32))
-        rings_by_class[r.klasse] = np.concatenate(
-            [rings_by_class[r.klasse], r.points], axis=0)
+        rings_by_class_buckets.setdefault(r.klasse, []).append(r.points)
+    rings_by_class: dict[str, np.ndarray] = {
+        k: np.concatenate(v, axis=0) if v else np.zeros((0, 3), dtype=np.float32)
+        for k, v in rings_by_class_buckets.items()
+    }
 
     render_facade_png(windows, wall_uv, args.output / "facade.png")
     render_pointcloud_png(wall_cloud, rings_by_class, normal, plane_centroid,
