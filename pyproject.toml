@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-envelope"
+version = "0.1.0"
+description = "Semantic envelope extraction from iPhone LiDAR scans"
+requires-python = ">=3.10,<3.12"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "slow: Tests, die echte Modelle laden oder große Daten brauchen",
+    "gpu: Tests, die eine CUDA-GPU voraussetzen",
+]

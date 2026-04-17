@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.egg-info/
+build/
+dist/
+
+# Test / Cache
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Projekt-spezifisch
+data/stray_scanner/*.zip
+data/stray_scanner/*_unpacked/
+tmp/
+outputs/
+*.npy
+*.log
+!tests/**/*.npy  # Testfixtures trotzdem tracken

@@ -1,0 +1,23 @@
+# Core numerics
+numpy>=1.26,<2.0
+scipy>=1.11
+pandas>=2.1
+
+# Computer Vision
+opencv-python>=4.8
+pillow>=10.0
+
+# ML / Models
+torch>=2.2
+torchvision>=0.17
+transformers>=4.41             # Grounding DINO via AutoModelForZeroShotObjectDetection
+# SAM 2: aus GitHub installieren (siehe README)
+# pip install "git+https://github.com/facebookresearch/sam2.git"
+
+# 3D / Visualisierung
+open3d>=0.18
+matplotlib>=3.8
+
+# Test-Framework
+pytest>=7.4
+pytest-cov>=4.1
