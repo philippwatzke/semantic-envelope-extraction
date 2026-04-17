@@ -195,19 +195,19 @@ class ThreePromptSegmenter:
                        if box_aspect_ratio_ok(b) and _label_to_klasse(l) is not None]
         target_masks = self._sam.masks_for_boxes([d[0] for d in target_dets])
 
-        # Qualitätsfilter + Klassenzuordnung
+        # Qualitätsfilter + Klassenzuordnung. target_dets ist bereits nach
+        # box_aspect_ratio_ok und _label_to_klasse is not None gefiltert; die
+        # laufende Variable i verfolgt die Ursprungsposition für Log-Zwecke.
         accepted: list[TargetInstance] = []
-        for i, (mask, (xyxy, score, label)) in enumerate(zip(target_masks, target_dets)):
+        for i, (mask, (_xyxy, score, label)) in enumerate(zip(target_masks, target_dets)):
             klasse = _label_to_klasse(label)
-            if klasse is None:
-                continue
             if not mask_area_ok(mask):
                 log.warning("frame %d inst %d: mask-area gate → verworfen", frame_id, i)
                 continue
             if not convex_hull_aspect_ok(mask):
                 log.warning("frame %d inst %d: hull-aspect gate → verworfen", frame_id, i)
                 continue
-            accepted.append(TargetInstance(instance_id=i, klasse=klasse,
+            accepted.append(TargetInstance(instance_id=len(accepted), klasse=klasse,
                                            mask=mask, score=score))
 
         # Überlappungen desambiguieren
@@ -223,6 +223,8 @@ class ThreePromptSegmenter:
         wall_mask = np.zeros((H, W), dtype=bool)
         for m in wall_masks:
             wall_mask |= m
+        if not wall_dets:
+            log.warning("frame %d: keine Wand-Boxen gefunden — wall_mask leer", frame_id)
 
         # ---- Negativ-Distraktoren → präzise SAM-Silhouette ----
         neg_dets = self._gdino.detect(rgb, NEGATIVE_PROMPT)
