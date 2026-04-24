@@ -1,0 +1,66 @@
+<h2>Architektur mit SAM 3 — vereinfacht</h2>
+<p class="subtitle">SAM 3 hat einen eingebauten DETR-Detektor, der auf Text konditioniert ist. Zwei Modelle werden eins.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Option B (alt) — Zwei-Stufen-Pipeline</div>
+    <div class="mockup-body" style="padding:24px;font-family:monospace;font-size:13px;line-height:1.8;">
+      <div style="color:#888;margin-bottom:12px;">Text: "solar panel"</div>
+      <div style="padding:10px;background:#2a2a2a;border-radius:4px;margin-bottom:8px;">↓ 1) <strong>GroundingDINO</strong></div>
+      <div style="color:#888;margin-bottom:8px;font-size:11px;">  → Bounding Boxes + Scores</div>
+      <div style="padding:10px;background:#2a2a2a;border-radius:4px;margin-bottom:8px;">↓ 2) <strong>SAM 2</strong> (Box-Prompt)</div>
+      <div style="color:#888;margin-bottom:8px;font-size:11px;">  → Pixel-Masken</div>
+      <div style="padding:10px;background:#2a2a2a;border-radius:4px;">↓ <strong>NMS + Polygonisierung</strong></div>
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid #333;color:#888;font-size:11px;">
+        • ~2 Modelle im VRAM<br>
+        • 2 Inferenzstufen pro Kachel<br>
+        • Zwei Fehlermodi
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup" style="outline:2px solid #22c55e;">
+    <div class="mockup-header" style="background:#0f2419;color:#22c55e;">Option B' (neu) — SAM 3 end-to-end</div>
+    <div class="mockup-body" style="padding:24px;font-family:monospace;font-size:13px;line-height:1.8;">
+      <div style="color:#888;margin-bottom:12px;">Text: "solar panel"</div>
+      <div style="padding:10px;background:#0f2419;border:1px solid #22c55e;border-radius:4px;margin-bottom:8px;color:#d4f0d4;">↓ <strong>SAM 3</strong> (DETR + Segmenter)</div>
+      <div style="color:#888;margin-bottom:8px;font-size:11px;">  → Masken + Boxes + Scores</div>
+      <div style="padding:10px;background:#2a2a2a;border-radius:4px;">↓ <strong>NMS + Polygonisierung</strong></div>
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid #333;color:#d4f0d4;font-size:11px;">
+        ✓ 1 Modell (848 M Params, ~4–6 GB)<br>
+        ✓ 1 Inferenzstufe pro Kachel<br>
+        ✓ Ein Fehlermodus statt zwei<br>
+        ✓ Detektor & Segmenter co-trained
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:32px;">
+  <h3>Gesamt-Pipeline</h3>
+  <div class="mockup">
+    <div class="mockup-header">Datenfluss: Text + BBox → GeoPackage</div>
+    <div class="mockup-body" style="padding:20px;font-family:monospace;font-size:12px;line-height:1.7;">
+      <div style="display:grid;grid-template-columns:1fr;gap:6px;">
+        <div style="padding:8px 12px;background:#1a3a5a;border-radius:4px;color:#a0c8ff;">① UI (FastAPI): Nutzer gibt Prompt + BBox ein → POST /jobs</div>
+        <div style="padding:8px 12px;background:#2a2a2a;border-radius:4px;">② WCS-Client (Bayern LDBV): lädt DOP20-GeoTIFF, speichert Affintransformation</div>
+        <div style="padding:8px 12px;background:#2a2a2a;border-radius:4px;">③ Geo-Tiler (rasterio): 1024×1024 Kacheln mit 256 px Overlap, jede Kachel kennt ihre Pixel-Offsets</div>
+        <div style="padding:8px 12px;background:#0f2419;border:1px solid #22c55e;border-radius:4px;color:#d4f0d4;">④ SAM 3 Inferenz: pro Kachel → Masken + Boxes + Scores</div>
+        <div style="padding:8px 12px;background:#2a2a2a;border-radius:4px;">⑤ Merger: Pixel-Masken → lokale Polygone (Shapely) → in DOP-Pixelraum projizieren → Polygon-NMS via IoU</div>
+        <div style="padding:8px 12px;background:#2a2a2a;border-radius:4px;">⑥ Georeferenzierung: Affintransformation × Polygon-Pixel → EPSG:25832-Koordinaten (GeoPandas)</div>
+        <div style="padding:8px 12px;background:#1a3a5a;border-radius:4px;color:#a0c8ff;">⑦ UI-Preview: GeoJSON-Endpoint → Leaflet-Karte → Nutzer validiert (✓/✗ pro Polygon)</div>
+        <div style="padding:8px 12px;background:#1a3a5a;border-radius:4px;color:#a0c8ff;">⑧ Export: gefilterte Polygone → GeoPackage (.gpkg)</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:24px;padding:16px 20px;background:#2a1a0f;border-left:3px solid #f59e0b;border-radius:4px;">
+  <div class="label" style="color:#f59e0b;">Ein Caveat zu SAM 3</div>
+  <p style="margin:8px 0 0 0;font-size:14px;">
+    SAM 3 erfordert <strong>Python 3.12+, PyTorch 2.7+, CUDA 12.6+</strong>. Das ist ein moderner Stack —
+    deine RTX 4070 unterstützt CUDA 12.6 problemlos, aber die Treiber müssen aktuell sein.
+    Das Modell ist neu (Nov 2025), Community-Tutorials sind rar, wir verlassen uns auf die offizielle Doku.
+    Falls die Lizenz (SAM License) problematisch werden sollte, ist ein Fallback auf Grounded-SAM-2 mit ~1 Tag Arbeit machbar.
+  </p>
+</div>

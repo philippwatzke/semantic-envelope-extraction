@@ -1,0 +1,124 @@
+<h2>Finale Architektur — wissenschaftlich belastbar</h2>
+<p class="subtitle">Sechs zusätzliche Korrekturen, gruppiert nach Auswirkung: Methodik, Robustheit, Performance.</p>
+
+<div class="section">
+  <h3 style="color:#ef4444;">Kritisch — Methodische Validität (Einwände 1, 5, 6)</h3>
+
+  <div class="section" style="margin-top:12px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #ef4444;border-radius:4px;">
+    <div class="label" style="color:#ef4444;">① Kachel-Überspringen → Zwei-Layer-GeoPackage</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Völlig richtig: stille False Negatives zerstören P/R-Metriken. Lösung im <code>exporter.py</code>:
+      das GeoPackage bekommt <strong>zwei Layer</strong>:
+    </p>
+    <ul style="margin:8px 0 0 20px;padding:0;font-size:14px;">
+      <li><code>detected_objects</code> — die Ziel-Polygone mit Score und Source-Tile-ID</li>
+      <li><code>nodata_regions</code> — Polygone (Kachel-Footprint) für jede fehlgeschlagene Kachel, inkl. Fehlerursache (OOM / WCS-Timeout / ungültige Geometrie)</li>
+    </ul>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Bei der ALKIS-Evaluation in QGIS: Referenz-Features, die <code>nodata_regions</code> schneiden, werden vor der P/R-Berechnung ausgeschlossen. Du misst dann wirklich Modell-Leistung, nicht Hardware-Ausfälle.
+    </p>
+  </div>
+
+  <div class="section" style="margin-top:12px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #ef4444;border-radius:4px;">
+    <div class="label" style="color:#ef4444;">⑤ Resampling beim WCS-Request → Grid-Snapping</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Absolut richtig und war ein blinder Fleck in der vorherigen Fassung. Der <code>wcs_client.py</code> macht jetzt zwingend:
+    </p>
+    <ol style="margin:8px 0 0 20px;padding:0;font-size:14px;">
+      <li>BBox von EPSG:4326 (Leaflet) nach EPSG:25832 transformieren (via <code>pyproj</code>)</li>
+      <li>Koordinaten auf Vielfache von 0.2 m snappen: <code>floor(x/0.2)*0.2</code> für Min, <code>ceil(x/0.2)*0.2</code> für Max</li>
+      <li>WCS-Request mit diesen snap-aligned Koordinaten absetzen</li>
+    </ol>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Damit lädt der Server den Ausschnitt in nativer Pixel-Auflösung <em>ohne</em> Interpolation. Das ist keine Optimierung, sondern Voraussetzung dafür, dass "DOP20" tatsächlich DOP20 bleibt.
+    </p>
+  </div>
+
+  <div class="section" style="margin-top:12px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #ef4444;border-radius:4px;">
+    <div class="label" style="color:#ef4444;">⑥ Kanten-Problem → Center-Keep-Tiling, nicht NMS</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Der Einwand ist strukturell völlig richtig: NMS mit IoU löst Frankenstein-Polygone nicht, weil zwei halbe Gebäude kaum überlappen. Standard-Lösung in der Remote-Sensing-Literatur, die wir übernehmen:
+    </p>
+    <div class="mockup" style="margin-top:12px;">
+      <div class="mockup-body" style="padding:16px;font-family:monospace;font-size:11px;line-height:1.6;">
+<pre style="margin:0;color:#ddd;">
+Neue Tiling-Parameter (bei DOP20, 20 cm/px):
+  Kachelgröße:      1024 × 1024 px  (204.8 m × 204.8 m)
+  Overlap:           320 px          (<strong>64 m</strong>)  ← &gt; größtes zu erwartendes Objekt
+  Rand-Exklusion:    160 px pro Seite (32 m)
+  Sicheres Zentrum:  704 × 704 px    (140.8 m × 140.8 m)
+
+Regel im merger.py:
+  Polygone, die <strong>das sichere Zentrum verlassen</strong>, werden verworfen.
+  Da jeder Raum-Punkt in mindestens einem Kachel-Zentrum liegt,
+  werden Objekte NIE zerschnitten — sie werden aus genau einer Kachel
+  vollständig übernommen.
+
+Fallback-NMS: nur noch als Tie-Breaker, wenn dasselbe Objekt in mehr
+als einem Zentrum erkannt wird (selten, aber möglich bei großen Objekten).
+</pre>
+      </div>
+    </div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Kostenrechnung: Bei 1 × 1 km² statt 49 Kacheln jetzt ~64 Kacheln (höherer Overlap), ~30% mehr Rechenzeit.
+      Diesen Preis zahlen wir gerne — ohne Center-Keep hat das ganze Projekt kein valides Ergebnis.
+      Für sehr große Zielobjekte (z. B. ganze Industriehallen &gt;60 m) müsste der Overlap angepasst werden — das wird als Config-Parameter exponiert.
+    </p>
+  </div>
+</div>
+
+<div class="section" style="margin-top:32px;">
+  <h3 style="color:#f59e0b;">Wichtig — Robustheit &amp; Performance (Einwände 2, 3, 4)</h3>
+
+  <div class="section" style="margin-top:12px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #f59e0b;border-radius:4px;">
+    <div class="label" style="color:#f59e0b;">② SQLite-Locking → WAL-Modus</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Richtig — Default-Modus blockiert bei jedem Write. In <code>jobs/store.py</code> bei jeder Connection-Initialisierung:
+    </p>
+    <pre style="margin:8px 0 0 0;padding:10px 14px;background:#0a0a0a;border-radius:4px;font-size:12px;color:#d4f0d4;">PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;      -- 5s Warten statt sofort Error
+PRAGMA synchronous = NORMAL;     -- schneller, ausreichend für Prototyp</pre>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      WAL erlaubt parallele Reads &amp; einen einzigen Writer. Der Webserver liest Status, Worker schreibt — kein Konflikt.
+    </p>
+  </div>
+
+  <div class="section" style="margin-top:12px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #f59e0b;border-radius:4px;">
+    <div class="label" style="color:#f59e0b;">③ VRAM-Fragmentierung → Graceful Worker-Restart</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Valid. PyTorch-Caching-Allocator fragmentiert unter variierenden Tensor-Größen. Zwei Maßnahmen kombiniert:
+    </p>
+    <ul style="margin:8px 0 0 20px;padding:0;font-size:14px;">
+      <li>Environment: <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> reduziert Fragmentierung</li>
+      <li>In <code>worker/loop.py</code>: nach <code>MAX_JOBS_PER_WORKER = 50</code> terminiert der Prozess sauber (setzt keine Jobs als failed, lässt sie als PENDING). Ein Supervisor (systemd-user / <code>scripts/run-worker.sh</code> mit <code>while true</code>) startet neu</li>
+      <li>Als Bonus: Startup-Recovery-Hook (bereits im Design) markiert etwaige PROCESSING-Jobs nach unerwarteten Exits</li>
+    </ul>
+  </div>
+
+  <div class="section" style="margin-top:12px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #f59e0b;border-radius:4px;">
+    <div class="label" style="color:#f59e0b;">④ RAM-Spitzen beim Merge → VRT statt rasterio.merge</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Richtig. <code>rasterio.merge</code> lädt alle Arrays in RAM. Stattdessen:
+    </p>
+    <ol style="margin:8px 0 0 20px;padding:0;font-size:14px;">
+      <li><code>wcs_client.py</code> schreibt jede paginierte Response als einzelnes GeoTIFF nach <code>data/dop/{job_id}/chunk_{i}.tif</code></li>
+      <li>Nach Download baut <code>gdal.BuildVRT()</code> eine <code>.vrt</code>-Datei — pure XML, kein Pixeltransfer</li>
+      <li><code>tiler.py</code> öffnet die VRT via rasterio wie eine einzige große Datei; GDAL liest nur die benötigten Pixelbereiche pro Kachel on-demand</li>
+    </ol>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Konsequenz: RAM-Footprint beim Download-Merge ist quasi null; beim Tile-Reading nur eine Kachel auf einmal.
+    </p>
+  </div>
+</div>
+
+<div class="section" style="margin-top:32px;padding:16px 20px;background:#0f2419;border-left:3px solid #22c55e;border-radius:4px;">
+  <div class="label" style="color:#22c55e;">Zusammenfassung der Architektur-Revisionen</div>
+  <p style="margin:8px 0 0 0;font-size:14px;">
+    Aus der ursprünglich naiven Zwei-Modul-Pipeline ist jetzt eine in drei Aspekten ernst zu nehmende Architektur geworden:
+  </p>
+  <ul style="margin:8px 0 0 20px;padding:0;font-size:14px;">
+    <li><strong>Methodisch valide:</strong> Grid-Snapping, Center-Keep-Tiling, NoData-Layer — garantiert dass gemessene Metriken tatsächlich Modell-Leistung abbilden</li>
+    <li><strong>Prozessrobust:</strong> zwei Prozesse über WAL-SQLite, Worker-Recovery, Restart-Supervisor — ein OOM stürzt nicht das ganze System</li>
+    <li><strong>Ressourcenbewusst:</strong> VRT statt Merge, expandable_segments, Center-Keep statt In-Memory-NMS — läuft nachweislich auf 12 GB VRAM / 64 GB RAM</li>
+  </ul>
+</div>

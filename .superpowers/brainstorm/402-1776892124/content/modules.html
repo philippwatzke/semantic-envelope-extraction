@@ -1,0 +1,68 @@
+<h2>Modulstruktur — drei klare Schichten</h2>
+<p class="subtitle">Jedes Modul hat einen Zweck, ein Interface, eine Testdatei. Kein Modul kennt mehr als seine direkten Nachbarn.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Verzeichnislayout</div>
+  <div class="mockup-body" style="padding:20px;font-family:monospace;font-size:12.5px;line-height:1.7;">
+<pre style="margin:0;color:#ddd;">
+ki_geodaten/
+├── <span style="color:#a0c8ff;">app/</span>                       <span style="color:#666;"># Schicht 1: UI (FastAPI + Leaflet)</span>
+│   ├── main.py                <span style="color:#666;"># FastAPI-App, Route-Registrierung</span>
+│   ├── routes/
+│   │   ├── jobs.py            <span style="color:#666;"># POST /jobs, GET /jobs, /jobs/{id}/status</span>
+│   │   ├── validation.py      <span style="color:#666;"># POST /jobs/{id}/polygons/{pid}/accept|reject</span>
+│   │   └── export.py          <span style="color:#666;"># GET /jobs/{id}/export.gpkg</span>
+│   ├── templates/index.html   <span style="color:#666;"># Leaflet-Karte, Prompt-Eingabe, BBox-Zeichner</span>
+│   └── static/                <span style="color:#666;"># app.js, style.css</span>
+│
+├── <span style="color:#22c55e;">pipeline/</span>                  <span style="color:#666;"># Schicht 2: Reine Bildverarbeitung</span>
+│   ├── wcs_client.py          <span style="color:#666;"># DOP20-Download von Bayern LDBV WCS</span>
+│   ├── tiler.py               <span style="color:#666;"># rasterio-basiertes Tiling + Affintransform</span>
+│   ├── segmenter.py           <span style="color:#666;"># SAM 3.1-Wrapper: (Tile, Prompt) → Masken+Boxes+Scores</span>
+│   ├── merger.py              <span style="color:#666;"># Polygon-NMS via Shapely über Kachel-Grenzen</span>
+│   ├── georeferencer.py       <span style="color:#666;"># Pixel-Polygone → EPSG:25832 (GeoPandas)</span>
+│   └── exporter.py            <span style="color:#666;"># GeoDataFrame → GeoPackage</span>
+│
+├── <span style="color:#fbbf24;">jobs/</span>                      <span style="color:#666;"># Schicht 3: Orchestrierung &amp; Persistenz</span>
+│   ├── orchestrator.py        <span style="color:#666;"># Führt die Pipeline-Schritte sequenziell aus</span>
+│   ├── store.py               <span style="color:#666;"># SQLite: Jobs, Polygone, Status, Validierungs-Flags</span>
+│   └── models.py              <span style="color:#666;"># Pydantic: Job, Polygon, BBox, JobStatus</span>
+│
+├── config.py                  <span style="color:#666;"># Pfade, WCS-URL, Modell-Checkpoint</span>
+├── data/
+│   ├── jobs.db                <span style="color:#666;"># SQLite</span>
+│   ├── dop/{job_id}.tif       <span style="color:#666;"># heruntergeladene Orthophotos</span>
+│   └── results/{job_id}.gpkg  <span style="color:#666;"># Export</span>
+│
+└── tests/
+    ├── test_tiler.py          <span style="color:#666;"># Fixture-GeoTIFF, bekannte Affintransformation</span>
+    ├── test_merger.py         <span style="color:#666;"># synthetische überlappende Polygone</span>
+    ├── test_georeferencer.py  <span style="color:#666;"># Pixel → UTM Transformation</span>
+    └── test_wcs_client.py     <span style="color:#666;"># Mock-WCS-Antworten</span>
+</pre>
+  </div>
+</div>
+
+<div class="section" style="margin-top:32px;">
+  <h3>Warum diese Aufteilung?</h3>
+  <div class="pros-cons">
+    <div class="pros">
+      <h4>Die drei Schichten sprechen in eine Richtung</h4>
+      <ul>
+        <li><strong>app/</strong> ruft <strong>jobs/</strong> — aber nicht <strong>pipeline/</strong> direkt</li>
+        <li><strong>jobs/</strong> orchestriert <strong>pipeline/</strong>-Module</li>
+        <li><strong>pipeline/</strong> kennt weder UI noch Jobs — reine Funktionen</li>
+        <li>→ Pipeline-Module sind per CLI/Notebook unabhängig testbar</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Jedes pipeline/-Modul</h4>
+      <ul>
+        <li>hat klar definierte Ein-/Ausgaben (typisiert via Pydantic)</li>
+        <li>ist ohne Seiteneffekte implementiert (außer I/O-Modulen)</li>
+        <li>hat eine 1:1-Testdatei</li>
+        <li>darf bei Bedarf ein eigenes Fachvokabular nutzen, aber exportiert nur einfache Dataclasses</li>
+      </ul>
+    </div>
+  </div>
+</div>

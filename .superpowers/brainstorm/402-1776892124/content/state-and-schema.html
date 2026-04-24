@@ -1,0 +1,138 @@
+<h2>Job-Zustandsautomat und SQLite-Schema</h2>
+<p class="subtitle">Die Quelle der Wahrheit — beide Prozesse (Webserver, Worker) lesen und schreiben ausschließlich über dieses Schema.</p>
+
+<div class="section">
+  <h3>Job-Statusübergänge</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="padding:24px;font-family:monospace;font-size:12px;line-height:1.8;">
+<pre style="margin:0;color:#ddd;">
+                           ┌─ (Worker-Restart-Hook räumt auf) ─┐
+                           │                                   │
+  <span style="color:#a0c8ff;">[POST /jobs]</span>                │                                   │
+       │                   ▼                                   │
+       ▼            ┌─────────────┐                            │
+  ┌──────────┐      │ DOWNLOADING │──► wcs_client (paginiert, VRT)
+  │ <span style="color:#fbbf24;">PENDING</span>  │──────►└─────────────┘                            │
+  └──────────┘             │                                   │
+       ▲                   ▼                                   │
+       │            ┌─────────────┐                            │
+       │            │   TILING    │──► tiler (center-keep, 320 px overlap)
+       │            └─────────────┘                            │
+       │                   │                                   │
+       │                   ▼                                   │
+       │            ┌─────────────┐                            │
+       │            │  INFERRING  │──► segmenter (SAM 3.1, pro Kachel)
+       │            └─────────────┘                            │
+       │                   │                                   │
+       │                   ▼                                   │
+       │     ┌──────────────────────┐                          │
+       │     │ READY_FOR_REVIEW     │◄── Nutzer prüft Polygone in UI
+       │     └──────────────────────┘                          │
+       │                   │                                   │
+       │            [POST /export]                             │
+       │                   ▼                                   │
+       │            ┌─────────────┐                            │
+       │            │  EXPORTED   │                            ▼
+       │            └─────────────┘                     ┌──────────┐
+       │                                                │ <span style="color:#ef4444;">FAILED</span>   │
+       └────────────────────────────────────────────────┤ + error  │
+                                                        └──────────┘
+</pre>
+    </div>
+  </div>
+  <p style="margin:12px 0 0 0;font-size:13px;color:#aaa;">
+    Nur der Worker darf Status verändern (außer Webserver: PENDING beim Erstellen, EXPORTED beim Export-Trigger).
+    Bei jedem Worker-Start: alle Jobs in DOWNLOADING/TILING/INFERRING werden auf FAILED mit Grund "worker_restarted" gesetzt.
+  </p>
+</div>
+
+<div class="section" style="margin-top:32px;">
+  <h3>SQLite-Schema</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="padding:20px;font-family:monospace;font-size:12px;line-height:1.65;">
+<pre style="margin:0;color:#ddd;">
+<span style="color:#888;">-- Initialisierung jeder Connection</span>
+PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE <span style="color:#fbbf24;">jobs</span> (
+    id                TEXT PRIMARY KEY,              <span style="color:#666;">-- UUID v4</span>
+    prompt            TEXT NOT NULL,
+    bbox_wgs84        TEXT NOT NULL,                 <span style="color:#666;">-- JSON: [minx,miny,maxx,maxy]</span>
+    bbox_utm_snapped  TEXT NOT NULL,                 <span style="color:#666;">-- JSON, grid-aligned 0.2 m</span>
+    status            TEXT NOT NULL,                 <span style="color:#666;">-- siehe State Machine</span>
+    error_reason      TEXT,                          <span style="color:#666;">-- enum: OOM, WCS_FAIL, ...</span>
+    error_message     TEXT,                          <span style="color:#666;">-- freier Text + Stacktrace-Tail</span>
+    dop_vrt_path      TEXT,                          <span style="color:#666;">-- nach Download gesetzt</span>
+    gpkg_path         TEXT,                          <span style="color:#666;">-- nach Export gesetzt</span>
+    tile_total        INTEGER,
+    tile_completed    INTEGER DEFAULT 0,
+    tile_failed       INTEGER DEFAULT 0,
+    created_at        TEXT NOT NULL,                 <span style="color:#666;">-- ISO-8601</span>
+    started_at        TEXT,
+    finished_at       TEXT
+);
+CREATE INDEX idx_jobs_status_created ON jobs(status, created_at);
+
+CREATE TABLE <span style="color:#22c55e;">polygons</span> (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id            TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    geometry_wkt      TEXT NOT NULL,                 <span style="color:#666;">-- WKT in EPSG:25832</span>
+    score             REAL NOT NULL,                 <span style="color:#666;">-- SAM 3.1 Detection Score</span>
+    source_tile_row   INTEGER NOT NULL,              <span style="color:#666;">-- für Debugging/Traceability</span>
+    source_tile_col   INTEGER NOT NULL,
+    validation        TEXT                            <span style="color:#666;">-- NULL | ACCEPTED | REJECTED</span>
+);
+CREATE INDEX idx_polygons_job ON polygons(job_id);
+
+CREATE TABLE <span style="color:#ef4444;">nodata_regions</span> (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id            TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    geometry_wkt      TEXT NOT NULL,                 <span style="color:#666;">-- Kachel-Footprint in EPSG:25832</span>
+    tile_row          INTEGER NOT NULL,
+    tile_col          INTEGER NOT NULL,
+    reason            TEXT NOT NULL                  <span style="color:#666;">-- OOM | WCS_TIMEOUT | SEG_FAULT | ...</span>
+);
+CREATE INDEX idx_nodata_job ON nodata_regions(job_id);
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:24px;">
+  <h3>Zentrale Pipeline-Interfaces</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="padding:20px;font-family:monospace;font-size:12px;line-height:1.65;">
+<pre style="margin:0;color:#ddd;"><span style="color:#888;"># pipeline/wcs_client.py</span>
+def download_dop20(bbox_utm: BBox25832, out_dir: Path) -> Path:
+    <span style="color:#888;">"""Paginiert ≤4000 px Requests, schreibt chunk_*.tif, liefert VRT-Pfad."""</span>
+
+<span style="color:#888;"># pipeline/tiler.py</span>
+def iter_tiles(vrt: Path, size: int = 1024, overlap: int = 320) -> Iterator[Tile]:
+    <span style="color:#888;">"""Tile enthält: numpy-Array, pixel-Offsets, geo-Footprint, Affine."""</span>
+
+<span style="color:#888;"># pipeline/segmenter.py</span>
+class Sam3Segmenter:
+    def __init__(self, checkpoint: Path, device: str = "cuda"): ...
+    def predict(self, tile: Tile, prompt: str) -> list[MaskResult]:
+        <span style="color:#888;">"""MaskResult: {mask_ndarray, score, box_pixel}."""</span>
+
+<span style="color:#888;"># pipeline/merger.py</span>
+def keep_center_only(masks: list[MaskResult], tile: Tile, margin: int = 160) -> list[MaskResult]:
+    <span style="color:#888;">"""Filtert Polygone, die den 704×704 Sicherheitsbereich verlassen."""</span>
+
+def masks_to_polygons(masks: list[MaskResult], tile: Tile) -> GeoDataFrame:
+    <span style="color:#888;">"""Raster→Vektor via rasterio.features.shapes, bereits in EPSG:25832."""</span>
+
+<span style="color:#888;"># pipeline/exporter.py</span>
+def export_two_layer_gpkg(
+    polygons_gdf: GeoDataFrame,       <span style="color:#888;"># Layer 1: detected_objects</span>
+    nodata_gdf:  GeoDataFrame,        <span style="color:#888;"># Layer 2: nodata_regions</span>
+    out_path:    Path,
+) -> None: ...
+</pre>
+    </div>
+  </div>
+</div>

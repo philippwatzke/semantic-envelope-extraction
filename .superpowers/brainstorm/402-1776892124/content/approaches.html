@@ -1,0 +1,118 @@
+<h2>Drei Stack-Optionen für den ML-Kern</h2>
+<p class="subtitle">Die UI (FastAPI + Leaflet) ist in allen drei Optionen gleich. Unterschied liegt nur im Segmentierungs-/Tiling-Kern.</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#1a1a1a;padding:24px;">
+      <div style="color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Option A</div>
+      <div style="color:#fff;font-size:18px;font-weight:600;margin-bottom:12px;">Klassisch (dein Vorschlag)</div>
+      <div style="color:#aaa;font-size:13px;line-height:1.6;">
+        <div>• GroundingDINO (original)</div>
+        <div>• SAM ViT-H (Meta 2023)</div>
+        <div>• SAHI für Tiling</div>
+        <div>• Rasterio I/O</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Maximal ausgereift</h3>
+      <div class="pros-cons">
+        <div class="pros">
+          <h4>Pros</h4>
+          <ul>
+            <li>Riesige Community, viele Tutorials</li>
+            <li>SAHI hat Batterien-inklusive (NMS, Visualisierung)</li>
+            <li>Am wenigsten Überraschungen</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>Cons</h4>
+          <ul>
+            <li>SAM ViT-H braucht ~6 GB VRAM — knapper Puffer</li>
+            <li>SAM v1 patzt bei filigranen Formen (Solar-Module)</li>
+            <li>SAHI ist bildzentriert, nicht geo-aware</li>
+            <li>Stack altert: Meta arbeitet nur noch an SAM2</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)" style="outline:2px solid #22c55e;outline-offset:-2px;">
+    <div class="card-image" style="background:#0f2419;padding:24px;">
+      <div style="color:#22c55e;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Option B — Empfehlung</div>
+      <div style="color:#fff;font-size:18px;font-weight:600;margin-bottom:12px;">Modernisiert</div>
+      <div style="color:#d4f0d4;font-size:13px;line-height:1.6;">
+        <div>• GroundingDINO (original)</div>
+        <div>• SAM 2.1 Hiera-Large</div>
+        <div>• Custom Geo-Tiler (rasterio)</div>
+        <div>• Shapely-NMS auf Polygon-Ebene</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Beste Qualität, geo-native</h3>
+      <div class="pros-cons">
+        <div class="pros">
+          <h4>Pros</h4>
+          <ul>
+            <li>SAM2 klar überlegen bei feinen Strukturen</li>
+            <li>SAM2-Large braucht nur ~4 GB VRAM</li>
+            <li>Custom Tiler kennt Affintransformation nativ</li>
+            <li>Polygon-NMS via Shapely statt Box-NMS — präziser</li>
+            <li>Aktiv von Meta gewartet (2024+)</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>Cons</h4>
+          <ul>
+            <li>SAM2-API etwas anders (Image-Predictor statt Mask-Generator)</li>
+            <li>Custom Tiler ist Eigenbau (~200 LOC)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c" onclick="toggleSelect(this)">
+    <div class="card-image" style="background:#1a1a1a;padding:24px;">
+      <div style="color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Option C</div>
+      <div style="color:#fff;font-size:18px;font-weight:600;margin-bottom:12px;">Austauschbar</div>
+      <div style="color:#aaa;font-size:13px;line-height:1.6;">
+        <div>• GroundingDINO (original)</div>
+        <div>• <em>Detector/Segmenter-Interface</em></div>
+        <div>• Adapter für SAM, SAM2, FastSAM</div>
+        <div>• Modellwahl pro Job</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Für systematisches Benchmarking</h3>
+      <div class="pros-cons">
+        <div class="pros">
+          <h4>Pros</h4>
+          <ul>
+            <li>Erlaubt A/B-Vergleiche SAM vs SAM2 vs FastSAM</li>
+            <li>Passt zu deinem Evaluations-Interesse (P/R/IoU)</li>
+            <li>Zukunftssicher für neue Modelle</li>
+          </ul>
+        </div>
+        <div class="cons">
+          <h4>Cons</h4>
+          <ul>
+            <li>Mehr Boilerplate (+1–2 Tage Arbeit)</li>
+            <li>Mehr Abhängigkeiten zu pflegen</li>
+            <li>Für Prototyp-MVP overkill</li>
+            <li>Kann später aus B nachgerüstet werden</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:32px;padding:16px 20px;background:#0f2419;border-left:3px solid #22c55e;border-radius:4px;">
+  <div class="label">Meine Empfehlung</div>
+  <p style="margin:8px 0 0 0;">
+    <strong>Option B</strong>. SAM2 ist bei Solarmodulen und filigranen Formen sichtbar besser — genau dein Use Case.
+    Ein eigener Geo-Tiler ist einfacher als er klingt (rasterio macht die Affintransformation schon) und du hast volle Kontrolle
+    über das Overlap/Merging-Verhalten. Der Refactor auf Option C ist später in ~1 Tag möglich, falls du Modellvergleiche willst.
+  </p>
+</div>

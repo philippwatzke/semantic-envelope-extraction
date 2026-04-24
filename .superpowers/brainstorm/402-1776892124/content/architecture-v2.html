@@ -1,0 +1,109 @@
+<h2>Überarbeitete Architektur — zwei Prozesse, eine GPU</h2>
+<p class="subtitle">Die harte Trennung von Webserver und GPU-Worker löst alle vier Probleme zugleich.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Prozess-Topologie</div>
+  <div class="mockup-body" style="padding:24px;font-family:monospace;font-size:12.5px;line-height:1.7;">
+<pre style="margin:0;color:#ddd;">
+┌─────────────────────────────────┐         ┌──────────────────────────────────┐
+│  <span style="color:#a0c8ff;">Prozess 1: Webserver</span>           │         │  <span style="color:#22c55e;">Prozess 2: GPU-Worker</span>            │
+│  (uvicorn, FastAPI)             │         │  (python -m ki_geodaten.worker)  │
+│                                 │         │                                  │
+│  • nimmt HTTP-Requests entgegen │         │  • einziger Prozess mit GPU-Zugriff │
+│  • schreibt Jobs als PENDING    │         │  • pollt SQLite alle 2 s         │
+│  • liefert Status &amp; GeoJSON     │         │  • verarbeitet strikt sequenziell │
+│  • berührt NIE die GPU          │         │  • hält 1× SAM 3.1 im VRAM       │
+└──────────────┬──────────────────┘         └───────────────┬──────────────────┘
+               │                                            │
+               └────────────┐              ┌────────────────┘
+                            ▼              ▼
+                    ┌─────────────────────────┐
+                    │   <span style="color:#fbbf24;">SQLite (jobs.db)</span>     │
+                    │   Quelle der Wahrheit   │
+                    │                         │
+                    │   jobs, polygons,       │
+                    │   tiles, validations    │
+                    └─────────────────────────┘
+</pre>
+  </div>
+</div>
+
+<div class="section" style="margin-top:32px;">
+  <h3>Wie jedes deiner vier Probleme gelöst wird</h3>
+
+  <div class="section" style="margin-top:16px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #22c55e;border-radius:4px;">
+    <div class="label" style="color:#22c55e;">① VRAM-Kollaps → Physikalisch unmöglich</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      Nur <strong>ein</strong> Worker-Prozess läuft. Concurrency=1 ist keine Vereinbarung, sondern eine
+      Eigenschaft des OS. Der Worker lädt SAM 3.1 <strong>einmalig beim Start</strong> und behält es im VRAM —
+      das spart die Lade-Zeit (~8 s) pro Job und garantiert, dass kein zweites Modell entsteht.
+      Die Job-Queue ist einfach eine <code>SELECT ... WHERE status='PENDING' ORDER BY created_at LIMIT 1</code>-Abfrage.
+    </p>
+  </div>
+
+  <div class="section" style="margin-top:16px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #22c55e;border-radius:4px;">
+    <div class="label" style="color:#22c55e;">② Blocking → Webserver sieht die Pipeline nie</div>
+    <p style="margin:8px 0 0 0;font-size:14px;">
+      <code>POST /jobs</code> macht exakt drei Dinge: Request validieren, Zeile in SQLite anlegen (Status PENDING),
+      Job-ID zurückgeben. Antwortzeit: &lt;50 ms. Der Webserver weiß nicht, ob überhaupt ein Worker läuft.
+      Der Client pollt <code>GET /jobs/{id}/status</code> — keine Long-Polls, keine WebSockets, keine Threads im Webserver.
+    </p>
+  </div>
+
+  <div class="section" style="margin-top:16px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #22c55e;border-radius:4px;">
+    <div class="label" style="color:#22c55e;">③ WCS-Pagination → Zwei-Ebenen-Tiling</div>
+    <div style="font-size:14px;margin-top:8px;">
+      <strong>Ebene A (Download-Tiling):</strong> <code>wcs_client.py</code> kennt <code>MAX_WCS_PIXELS = 4000</code>.
+      Bei größeren BBoxes: Raster aus Sub-Requests, jeweils ≤4000×4000 px, dann lokal via <code>rasterio.merge</code>
+      zu <strong>einem</strong> GeoTIFF zusammengesetzt. Affintransformation bleibt konsistent.
+      <br><br>
+      <strong>Ebene B (Inference-Tiling):</strong> <code>tiler.py</code> operiert auf dem gemergten GeoTIFF und
+      produziert 1024×1024-Kacheln mit 256 px Overlap für SAM 3.1. Unabhängig von WCS-Limits.
+    </div>
+  </div>
+
+  <div class="section" style="margin-top:16px;padding:16px 20px;background:#1a1a1a;border-left:3px solid #22c55e;border-radius:4px;">
+    <div class="label" style="color:#22c55e;">④ OOM/Crash-Handling → Worker-Resilienz</div>
+    <div style="font-size:14px;margin-top:8px;">
+      Drei Absicherungen, in dieser Reihenfolge:
+      <ul style="margin:8px 0 0 20px;padding:0;">
+        <li><strong>Worker-Startup-Hook:</strong> markiert alle Jobs mit Status <code>PROCESSING</code> als
+          <code>FAILED (worker restarted)</code> — befreit die Queue nach Crash.</li>
+        <li><strong>Globales try/except</strong> um <code>orchestrator.run(job)</code>: jeder Fehler
+          (inkl. <code>torch.cuda.OutOfMemoryError</code>) landet im Status <code>FAILED</code>
+          mit Stacktrace in <code>jobs.error_message</code>, sichtbar in der UI.</li>
+        <li><strong>Per-Tile-try/except</strong> in <code>segmenter.py</code>: wenn <em>eine</em> Kachel OOM wirft,
+          wird sie übersprungen (<code>torch.cuda.empty_cache()</code>), der Job liefert Teilergebnisse
+          statt ganz zu scheitern.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:24px;">
+  <h3>Angepasstes Verzeichnislayout</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="padding:20px;font-family:monospace;font-size:12px;line-height:1.7;">
+<pre style="margin:0;color:#ddd;">
+ki_geodaten/
+├── <span style="color:#a0c8ff;">app/</span>                      <span style="color:#666;"># Webserver-Prozess</span>
+│   └── ... (wie zuvor)
+│
+├── <span style="color:#22c55e;">worker/</span>                   <span style="color:#666;"># NEU: eigener GPU-Worker-Prozess</span>
+│   ├── __main__.py           <span style="color:#666;"># Einstiegspunkt: python -m ki_geodaten.worker</span>
+│   ├── loop.py               <span style="color:#666;"># Poll-Loop, Startup-Recovery, Signal-Handling</span>
+│   └── orchestrator.py       <span style="color:#666;"># Führt Pipeline-Schritte aus, setzt Job-Status</span>
+│
+├── <span style="color:#22c55e;">pipeline/</span>                 <span style="color:#666;"># wie zuvor — reine Funktionen</span>
+│   ├── wcs_client.py         <span style="color:#666;"># MIT Request-Pagination (4000-px-Limit)</span>
+│   └── ... (wie zuvor)
+│
+├── <span style="color:#fbbf24;">jobs/</span>
+│   ├── store.py              <span style="color:#666;"># SQLite-Zugriff (von app/ UND worker/ genutzt)</span>
+│   └── models.py             <span style="color:#666;"># Pydantic + Enum JobStatus</span>
+│
+└── scripts/dev.sh            <span style="color:#666;"># startet uvicorn + worker parallel</span>
+</pre>
+    </div>
+  </div>
+</div>
