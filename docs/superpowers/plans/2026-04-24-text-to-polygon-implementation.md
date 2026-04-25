@@ -24,7 +24,7 @@ ki_geodaten/
 ├── pipeline/
 │   ├── __init__.py
 │   ├── geo_utils.py              # snap_floor/snap_ceil (Decimal), transform_bounds wrapper
-│   ├── wcs_client.py             # DOP20 download, grid-snap, pagination, VRT build
+│   ├── dop_client.py             # DOP20 WMS download, meter-snap, pagination, PNG→GeoTIFF wrap, VRT build
 │   ├── tiler.py                  # iter_tiles, TileConfig, NoData detection
 │   ├── segmenter.py              # Sam3Segmenter, local mask NMS
 │   ├── merger.py                 # keep_center_only, masks_to_polygons, extract_polygons
@@ -63,7 +63,7 @@ ki_geodaten/
 │   ├── conftest.py               # Fixtures: tmp DB, synthetic GeoTIFF, stub segmenter
 │   ├── pipeline/
 │   │   ├── test_geo_utils.py
-│   │   ├── test_wcs_client.py
+│   │   ├── test_dop_client.py
 │   │   ├── test_tiler.py
 │   │   ├── test_segmenter.py
 │   │   ├── test_merger.py
@@ -85,60 +85,77 @@ ki_geodaten/
 
 ---
 
-## Task 0: WCS Capabilities Verification Gate
+## Task 0: WMS Capabilities Verification Gate
 
 **Files:**
-- Create: `docs/wcs-verification.md`
+- Create: `docs/wms-verification.md` (replaces obsolete `docs/wcs-verification.md`)
 
-**Must complete before Task 7/8 implementation.** The WCS client must not hard-code guessed LDBV request axes, coverage IDs, grid origins, or pixel limits. Verify them once from a real `GetCapabilities` / coverage description response and document the values.
+**Must complete before Task 7/8 implementation.** The DOP client uses LDBV's OpenData WMS (`https://geoservices.bayern.de/od/wms/dop/v1/dop20`, CC BY 4.0, no auth). The WMS has no native pixel grid — pixel-accurate mosaicking depends on the server consistently sampling its source raster when the client requests BBoxes aligned to a 0.2 m meter grid. This task verifies that assumption empirically before writing the client.
 
-- [ ] **Step 1: Verify LDBV WCS metadata manually**
+- [ ] **Step 1: Delete stale WCS verification doc, create WMS one**
 
-Record these values in `docs/wcs-verification.md`:
+```bash
+git rm docs/wcs-verification.md
+```
+
+Write `docs/wms-verification.md`:
 
 ```markdown
-# LDBV DOP20 WCS Verification
+# LDBV DOP20 WMS Verification
 
 Verified on: YYYY-MM-DD
 
-- WCS_URL:
-- WCS_VERSION:
-- WCS_COVERAGE_ID:
-- WCS_MAX_PIXELS:
-- WCS_GRID_ORIGIN_X:
-- WCS_GRID_ORIGIN_Y:
-- WCS_SUBSET_AXIS_X:
-- WCS_SUBSET_AXIS_Y:
-- WCS_SCALE_SIZE_PARAM:
-- WCS_SIZE_AXIS_X:
-- WCS_SIZE_AXIS_Y:
-- CRS URI:
+- WMS_URL:           https://geoservices.bayern.de/od/wms/dop/v1/dop20
+- WMS_VERSION:       1.1.1
+- WMS_LAYER:         by_dop20c
+- WMS_CRS:           EPSG:25832
+- WMS_FORMAT:        image/png
+- WMS_MAX_PIXELS:    6000
+- PNG band count:    4 (RGBA) — Alpha is NoData mask
+- Pixel resolution:  0.2 m native
+- Coverage bbox (EPSG:25832): minx=497000 miny=5234000 maxx=857000 maxy=5604000
 
-Evidence:
-- GetCapabilities URL:
-- DescribeCoverage URL:
-- Relevant XML snippets:
-- One tested GetCoverage URL:
-- Result of adjacent-chunk edge test:
+## Evidence
+
+- GetCapabilities URL: https://geoservices.bayern.de/od/wms/dop/v1/dop20?SERVICE=WMS&REQUEST=GetCapabilities
+- Supported formats (verbatim from <Format> tags):
+- Supported CRS (verbatim from <SRS> tags):
+- Max pixels clause (from <Abstract>):
+- Tested GetMap URL (Munich-area, 500×500 px):
+- PIL-verified band count of response:
+- Adjacent-chunk edge test — URL A:
+- Adjacent-chunk edge test — URL B:
+- Edge test result: pixel at column 0 of chunk B matches pixel at column (width-1) of chunk A? (yes/no, numerical diff)
+
+## Notes
 ```
 
-- [ ] **Step 2: Validate one tiny `GetCoverage` request**
+- [ ] **Step 2: Perform the adjacent-chunk edge test**
 
-Use a known tiny Munich-area bbox in EPSG:25832 and verify:
-- The server accepts the selected `subset` axis labels/order.
-- The response has CRS EPSG:25832.
-- Pixel dimensions match `round((max-min)/0.2)`.
-- Two adjacent test chunks with `next_minx = prev_maxx` mosaic without a gap or duplicate pixel row/column.
+The WMS has no server-side grid. Verify empirically that two BBoxes snapped to the 0.2 m meter grid with `next_minx == prev_maxx` produce pixel-aligned mosaics.
+
+Pick a Munich-area AOI. For example:
+- Chunk A: `BBOX=690000,5334000,690100,5334100` (100 m × 100 m) → `WIDTH=500&HEIGHT=500` (exact 0.2 m/px)
+- Chunk B: `BBOX=690100,5334000,690200,5334100` (adjacent east) → same WIDTH/HEIGHT
+
+Request both with `VERSION=1.1.1`, `LAYERS=by_dop20c`, `SRS=EPSG:25832`, `FORMAT=image/png`, `TRANSPARENT=TRUE`.
+
+Decode both PNGs (Pillow / numpy), compare:
+- Chunk A column `499` (rightmost) vs Chunk B column `0` (leftmost).
+- Within a geographically smooth area, these should be effectively identical (pixel difference ≤ 1-2 values per channel due to JPEG-style internal compression artefacts, not structural drift).
+- Check for structural drift: if corresponding row features (e.g., a road edge) appear at different row positions, the server is resampling inconsistently → WMS pivot is not viable, fall back to WCS with credentials.
+
+Record the diff numerically in `docs/wms-verification.md` Evidence section.
 
 - [ ] **Step 3: Propagate verified values into config defaults**
 
-Only after Step 1/2 are done, set `WCS_URL`, `WCS_COVERAGE_ID`, `WCS_MAX_PIXELS`, `WCS_GRID_ORIGIN_X/Y`, WCS axis labels, and the WCS 2.0 scale-size parameter name in `.env.example` / `config.py`.
+Only after Step 1/2 pass, set `WMS_URL`, `WMS_LAYER`, `WMS_VERSION`, `WMS_FORMAT`, `WMS_CRS`, `WMS_MAX_PIXELS` in `.env.example` / `config.py`. Unlike WCS, there is no grid origin — the meter-snap origin is fixed at `(0.0, 0.0)` in EPSG:25832 by convention (any origin on a 0.2 m grid works; `(0, 0)` is the simplest and matches integer snapping).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/wcs-verification.md
-git commit -m "docs: verify LDBV DOP20 WCS capabilities"
+git add docs/wms-verification.md
+git commit -m "docs: verify LDBV DOP20 WMS capabilities and pixel alignment"
 ```
 
 ---
@@ -212,14 +229,12 @@ models/*.pt
 - [ ] **Step 4: Create `.env.example`**
 
 ```
-WCS_URL=https://geoservices.bayern.de/wcs/v2/dop20
-WCS_COVERAGE_ID=by_dop20rgb
-WCS_VERSION=2.0.1
-WCS_SUBSET_AXIS_X=<from GetCapabilities>
-WCS_SUBSET_AXIS_Y=<from GetCapabilities>
-WCS_SCALE_SIZE_PARAM=ScaleSize
-WCS_SIZE_AXIS_X=<from GetCapabilities>
-WCS_SIZE_AXIS_Y=<from GetCapabilities>
+WMS_URL=https://geoservices.bayern.de/od/wms/dop/v1/dop20
+WMS_LAYER=by_dop20c
+WMS_VERSION=1.1.1
+WMS_FORMAT=image/png
+WMS_CRS=EPSG:25832
+WMS_MAX_PIXELS=6000
 SAM3_CHECKPOINT=models/sam3.1_hiera_large.pt
 ```
 
@@ -252,7 +267,14 @@ from ki_geodaten.config import Settings
 
 def test_settings_defaults():
     s = Settings()
-    assert s.WCS_MAX_PIXELS == 4000
+    assert s.WMS_URL == "https://geoservices.bayern.de/od/wms/dop/v1/dop20"
+    assert s.WMS_LAYER == "by_dop20c"
+    assert s.WMS_VERSION == "1.1.1"
+    assert s.WMS_FORMAT == "image/png"
+    assert s.WMS_CRS == "EPSG:25832"
+    assert s.WMS_MAX_PIXELS == 6000
+    assert s.WMS_GRID_ORIGIN_X == 0.0
+    assert s.WMS_GRID_ORIGIN_Y == 0.0
     assert s.TILE_SIZE == 1024
     assert s.DEFAULT_TILE_PRESET == "medium"
     assert s.MIN_POLYGON_AREA_M2 == 1.0
@@ -267,14 +289,6 @@ def test_settings_defaults():
     assert s.MAX_CLIENT_BUFFER_UPDATES == 100
     assert s.BAYERN_BBOX_WGS84 == (8.9, 47.2, 13.9, 50.6)
     assert s.RETENTION_DAYS == 7
-    assert s.WCS_GRID_ORIGIN_X == 0.0
-    assert s.WCS_GRID_ORIGIN_Y == 0.0
-    assert s.WCS_VERSION == "2.0.1"
-    assert s.WCS_SUBSET_AXIS_X == "PLACEHOLDER_UNTIL_VERIFIED"
-    assert s.WCS_SUBSET_AXIS_Y == "PLACEHOLDER_UNTIL_VERIFIED"
-    assert s.WCS_SCALE_SIZE_PARAM == "ScaleSize"
-    assert s.WCS_SIZE_AXIS_X == "PLACEHOLDER_UNTIL_VERIFIED"
-    assert s.WCS_SIZE_AXIS_Y == "PLACEHOLDER_UNTIL_VERIFIED"
 
 def test_settings_env_override(monkeypatch):
     monkeypatch.setenv("MAX_BBOX_AREA_KM2", "2.5")
@@ -297,18 +311,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # WCS
-    WCS_URL: str = "PLACEHOLDER_UNTIL_VERIFIED"
-    WCS_COVERAGE_ID: str = "PLACEHOLDER_UNTIL_VERIFIED"
-    WCS_VERSION: str = "2.0.1"
-    WCS_MAX_PIXELS: int = 4000
-    WCS_GRID_ORIGIN_X: float = 0.0
-    WCS_GRID_ORIGIN_Y: float = 0.0
-    WCS_SUBSET_AXIS_X: str = "PLACEHOLDER_UNTIL_VERIFIED"
-    WCS_SUBSET_AXIS_Y: str = "PLACEHOLDER_UNTIL_VERIFIED"
-    WCS_SCALE_SIZE_PARAM: str = "ScaleSize"
-    WCS_SIZE_AXIS_X: str = "PLACEHOLDER_UNTIL_VERIFIED"
-    WCS_SIZE_AXIS_Y: str = "PLACEHOLDER_UNTIL_VERIFIED"
+    # WMS (LDBV OpenData DOP20 — Task 0 verified)
+    WMS_URL: str = "https://geoservices.bayern.de/od/wms/dop/v1/dop20"
+    WMS_LAYER: str = "by_dop20c"
+    WMS_VERSION: str = "1.1.1"
+    WMS_FORMAT: str = "image/png"
+    WMS_CRS: str = "EPSG:25832"
+    WMS_MAX_PIXELS: int = 6000
+    # WMS has no native server-side grid; we snap client-side to this origin.
+    # (0.0, 0.0) + 0.2 m step is the natural integer-meter raster for DOP20.
+    WMS_GRID_ORIGIN_X: float = 0.0
+    WMS_GRID_ORIGIN_Y: float = 0.0
 
     # SAM 3.1
     SAM3_CHECKPOINT: Path = Path("models/sam3.1_hiera_large.pt")
@@ -430,8 +443,8 @@ class JobStatus(StrEnum):
     FAILED = "FAILED"
 
 class ErrorReason(StrEnum):
-    WCS_TIMEOUT = "WCS_TIMEOUT"
-    WCS_HTTP_ERROR = "WCS_HTTP_ERROR"
+    DOP_TIMEOUT = "DOP_TIMEOUT"
+    DOP_HTTP_ERROR = "DOP_HTTP_ERROR"
     OOM = "OOM"
     INFERENCE_ERROR = "INFERENCE_ERROR"
     WORKER_RESTARTED = "WORKER_RESTARTED"
@@ -721,7 +734,7 @@ CREATE TABLE IF NOT EXISTS jobs (
                           'PENDING','DOWNLOADING','INFERRING',
                           'READY_FOR_REVIEW','EXPORTED','FAILED')),
     error_reason      TEXT CHECK (error_reason IS NULL OR error_reason IN (
-                          'WCS_TIMEOUT','WCS_HTTP_ERROR','OOM',
+                          'DOP_TIMEOUT','DOP_HTTP_ERROR','OOM',
                           'INFERENCE_ERROR','WORKER_RESTARTED',
                           'EXPORT_ERROR','INVALID_GEOMETRY')),
     error_message     TEXT,
@@ -1078,13 +1091,15 @@ git commit -m "feat(jobs): polygon/nodata persistence, bulk validate, claim, sta
 
 ---
 
-## Task 7: WCS Client — BBox Prep (Snap + Margin + Min-Size)
+## Task 7: DOP Client — BBox Prep (Snap + Margin + Min-Size)
 
 **Files:**
-- Create: `ki_geodaten/pipeline/wcs_client.py`
-- Test: `tests/pipeline/test_wcs_client.py`
+- Create: `ki_geodaten/pipeline/dop_client.py`
+- Test: `tests/pipeline/test_dop_client.py`
 
 **See Spec §5.1 pts 1, 4, 5, 6** — snapping, margin expansion, minimum size, pixel-count via round().
+
+**Provider:** LDBV OpenData WMS (no auth, CC BY 4.0). Because WMS has no server-advertised grid, the snap origin is fixed at `(0.0, 0.0)` — the natural integer-meter raster of EPSG:25832. Task 0's edge test verified that the server samples consistently when the client requests BBoxes aligned to the 0.2 m meter grid, so the same snap-to-grid contract that would apply to WCS holds here.
 
 **Resolved design decision:** Margin expansion is `CENTER_MARGIN_PX[preset] * 0.2m` (= 32 m / 64 m / 96 m for small / medium / large). The larger values 64 m / 128 m / 192 m are the max-object diameters (`2 * CENTER_MARGIN`) and are not the download expansion. Spec §5.1 pt 4 has been aligned with this formula.
 
@@ -1093,10 +1108,10 @@ Split of concerns: this task implements only the pure geometry math; HTTP comes 
 - [ ] **Step 1: Write failing test**
 
 ```python
-# tests/pipeline/test_wcs_client.py
+# tests/pipeline/test_dop_client.py
 import pytest
-from ki_geodaten.pipeline.wcs_client import (
-    prepare_download_bbox, WCSError, PreparedBBox,
+from ki_geodaten.pipeline.dop_client import (
+    prepare_download_bbox, DopDownloadError, PreparedBBox,
 )
 from ki_geodaten.models import TilePreset
 
@@ -1160,13 +1175,13 @@ def test_prepare_with_nonzero_origin():
 
 - [ ] **Step 2: Run to confirm failure**
 
-Run: `pytest tests/pipeline/test_wcs_client.py -v`
+Run: `pytest tests/pipeline/test_dop_client.py -v`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `wcs_client.py` (geometry only; HTTP is Task 8)**
+- [ ] **Step 3: Implement `dop_client.py` (geometry only; HTTP is Task 8)**
 
 ```python
-# ki_geodaten/pipeline/wcs_client.py
+# ki_geodaten/pipeline/dop_client.py
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
@@ -1185,7 +1200,8 @@ CENTER_MARGIN_PX: dict[TilePreset, int] = {
     TilePreset.LARGE: 480,
 }
 
-class WCSError(Exception):
+class DopDownloadError(Exception):
+    """Transport or mosaic error from the DOP20 WMS client (Task 8)."""
     pass
 
 @dataclass(frozen=True)
@@ -1241,40 +1257,43 @@ def prepare_download_bbox(
 
 - [ ] **Step 4: Run tests**
 
-Run: `pytest tests/pipeline/test_wcs_client.py -v`
+Run: `pytest tests/pipeline/test_dop_client.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ki_geodaten/pipeline/wcs_client.py tests/pipeline/test_wcs_client.py
-git commit -m "feat(wcs): BBox prep with grid-snap, margin expansion, min-size"
+git add ki_geodaten/pipeline/dop_client.py tests/pipeline/test_dop_client.py
+git commit -m "feat(dop): BBox prep with meter-snap, margin expansion, min-size"
 ```
 
 ---
 
-## Task 8: WCS Client — Chunk Grid & HTTP Download + VRT
+## Task 8: DOP Client — Chunk Grid & WMS HTTP Download + VRT
 
 **Files:**
-- Modify: `ki_geodaten/pipeline/wcs_client.py`
-- Test: `tests/pipeline/test_wcs_client.py` (append)
+- Modify: `ki_geodaten/pipeline/dop_client.py`
+- Test: `tests/pipeline/test_dop_client.py` (append)
 
-**See Spec §5.1 pts 2, 3, 6, 7, 8 and Task 0** — pagination grid, HTTP with retry, round() for pixels, contiguous edges, BuildVRT. Axis labels, WCS version, and the WCS 2.0 scaling parameter (`ScaleSize` unless Task 0 proves an LDBV-specific alternative) MUST come from verified config values, not hard-coded guesses.
+**See Spec §5.1 pts 2, 3, 6, 7, 8 and Task 0** — pagination grid, HTTP with retry, `round()` for pixels, contiguous edges, BuildVRT. The provider is the LDBV OpenData WMS (`GetMap`), not WCS. Key differences from a WCS client:
+- No server-side coverage axis labels / scale-size params — just `BBOX`, `WIDTH`, `HEIGHT` in WMS 1.1.1 (`SRS=EPSG:25832`, X/Y order).
+- WMS returns a raw raster without embedded georeferencing. We wrap the PNG bytes into a GeoTIFF with a client-constructed affine transform, then `gdal.BuildVRT` over the GeoTIFFs.
+- PNG comes as 4-band RGBA. Band 4 (alpha) is the NoData mask for areas outside the orthophoto coverage — it MUST be preserved into the wrapped GeoTIFF so that downstream `rasterio.DatasetReader.dataset_mask()` works (Task 11).
 
 - [ ] **Step 1: Append failing tests**
 
 ```python
-# tests/pipeline/test_wcs_client.py (append)
-from ki_geodaten.pipeline.wcs_client import plan_chunk_grid, download_dop20
+# tests/pipeline/test_dop_client.py (append)
+from ki_geodaten.pipeline.dop_client import plan_chunk_grid, download_dop20
 
 def test_chunk_grid_seamless_edges():
-    # 2000m × 2000m box, MAX_WCS_PIXELS=4000 → chunk side 4000*0.2 = 800m
+    # 2000m × 2000m box, WMS_MAX_PIXELS=6000 → chunk side 6000*0.2 = 1200m
     chunks = plan_chunk_grid(
         minx=0.0, miny=0.0, maxx=2000.0, maxy=2000.0,
-        max_pixels=4000, step=0.2, origin_x=0.0, origin_y=0.0,
+        max_pixels=6000, step=0.2, origin_x=0.0, origin_y=0.0,
     )
-    # Expect 3×3 grid (800 + 800 + 400 remainder)
-    assert len(chunks) == 9
+    # Expect 2×2 grid (1200 + 800 remainder)
+    assert len(chunks) == 4
     # All chunks aligned to 0.2 grid
     for c in chunks:
         for v in (c.minx, c.miny, c.maxx, c.maxy):
@@ -1291,64 +1310,74 @@ def test_chunk_grid_seamless_edges():
 def test_chunk_grid_small_bbox_single_chunk():
     chunks = plan_chunk_grid(
         minx=0.0, miny=0.0, maxx=204.8, maxy=204.8,
-        max_pixels=4000, step=0.2, origin_x=0.0, origin_y=0.0,
+        max_pixels=6000, step=0.2, origin_x=0.0, origin_y=0.0,
     )
     assert len(chunks) == 1
 
 def test_download_dop20_http_success(tmp_path, responses):
-    # responses fixture via pytest-responses; mock WCS GetCoverage
-    # Implementation uses requests, so responses activates automatic mocking.
-    # We emit a valid minimal GeoTIFF blob per call.
+    # Mock WMS GetMap. Implementation uses requests; `responses` intercepts it.
+    # We emit a valid minimal PNG RGBA blob per call — the client is responsible
+    # for wrapping it into a georeferenced GeoTIFF.
+    import io
     import numpy as np
+    from PIL import Image
     import rasterio
     from rasterio.transform import from_bounds
 
-    def make_tif(bbox):
-        path = tmp_path / "fake.tif"
-        w = round((bbox[2] - bbox[0]) / 0.2)
-        h = round((bbox[3] - bbox[1]) / 0.2)
-        with rasterio.open(
-            path, "w", driver="GTiff", height=h, width=w,
-            count=3, dtype="uint8", crs="EPSG:25832",
-            transform=from_bounds(*bbox, w, h),
-        ) as dst:
-            dst.write(np.zeros((3, h, w), dtype="uint8"))
-        return path.read_bytes()
+    def make_png(w: int, h: int) -> bytes:
+        arr = np.zeros((h, w, 4), dtype=np.uint8)
+        arr[..., 3] = 255  # opaque alpha
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="RGBA").save(buf, format="PNG")
+        return buf.getvalue()
 
     bbox = (0.0, 0.0, 204.8, 204.8)
+    w = round((bbox[2] - bbox[0]) / 0.2)
+    h = round((bbox[3] - bbox[1]) / 0.2)
     responses.add(
         responses.GET,
-        "http://example/wcs",
-        body=make_tif(bbox),
+        "http://example/wms",
+        body=make_png(w, h),
         status=200,
-        content_type="image/tiff",
+        content_type="image/png",
     )
 
     vrt_path = download_dop20(
-        bbox_utm=bbox, preset_center_margin_px=320, out_dir=tmp_path,
-        wcs_url="http://example/wcs", coverage_id="cov1",
-        max_pixels=4000, origin_x=0.0, origin_y=0.0,
-        wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-        scale_size_param="ScaleSize",
-        size_axis_x="E", size_axis_y="N",
+        bbox_utm=bbox, out_dir=tmp_path,
+        wms_url="http://example/wms", layer="by_dop20c",
+        wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
+        max_pixels=6000, origin_x=0.0, origin_y=0.0,
     )
     assert vrt_path.exists()
     assert vrt_path.suffix == ".vrt"
+    # Verify the chunk GeoTIFF is actually georeferenced and preserves alpha
+    tif = next(tmp_path.glob("chunk_*.tif"))
+    with rasterio.open(tif) as src:
+        assert src.crs.to_string() == "EPSG:25832"
+        assert src.count == 4  # RGBA preserved
+        assert src.bounds.left == 0.0
+        assert src.bounds.right == 204.8
 ```
 
 - [ ] **Step 2: Run to confirm failure**
 
-Run: `pytest tests/pipeline/test_wcs_client.py -v`
+Run: `pytest tests/pipeline/test_dop_client.py -v`
 Expected: new tests FAIL.
 
 - [ ] **Step 3: Append implementation**
 
 ```python
-# ki_geodaten/pipeline/wcs_client.py (append)
-from dataclasses import dataclass
+# ki_geodaten/pipeline/dop_client.py (append)
+import io
 import logging
-from osgeo import gdal
+from dataclasses import dataclass
+
+import numpy as np
+import rasterio
 import requests
+from osgeo import gdal
+from PIL import Image
+from rasterio.transform import from_bounds
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -1401,51 +1430,90 @@ def _build_session() -> requests.Session:
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
-def _fetch_chunk(
-    session: requests.Session, wcs_url: str, coverage_id: str,
-    chunk: ChunkPlan, out_path: Path, *,
-    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
-    scale_size_param: str,
-    size_axis_x: str, size_axis_y: str,
+def _png_bytes_to_array(payload: bytes) -> np.ndarray:
+    """Decode WMS PNG response to HxWxC uint8 ndarray (RGBA expected)."""
+    img = Image.open(io.BytesIO(payload))
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    return np.asarray(img)
+
+def _write_geotiff(
+    out_path: Path, arr: np.ndarray,
+    bbox: tuple[float, float, float, float], crs: str,
 ) -> None:
-    """WCS GetCoverage; axis labels/order are verified in Task 0 and passed via config."""
+    """Wrap an HxWxC uint8 RGBA ndarray into a 4-band GeoTIFF.
+    Band 4 is written as the alpha/NoData mask so rasterio.dataset_mask()
+    returns it downstream (Task 11)."""
+    h, w, c = arr.shape
+    if c != 4:
+        raise DopDownloadError(f"Expected RGBA from WMS, got {c} bands")
+    transform = from_bounds(*bbox, w, h)
+    with rasterio.open(
+        out_path, "w", driver="GTiff",
+        height=h, width=w, count=4, dtype="uint8",
+        crs=crs, transform=transform,
+        photometric="RGB",
+    ) as dst:
+        # (H, W, C) → (C, H, W) for rasterio band order
+        for i in range(4):
+            dst.write(arr[..., i], i + 1)
+        # Declare band 4 as alpha so dataset_mask() finds it
+        dst.colorinterp = (
+            rasterio.enums.ColorInterp.red,
+            rasterio.enums.ColorInterp.green,
+            rasterio.enums.ColorInterp.blue,
+            rasterio.enums.ColorInterp.alpha,
+        )
+
+def _fetch_chunk(
+    session: requests.Session, wms_url: str, layer: str,
+    chunk: ChunkPlan, out_path: Path, *,
+    wms_version: str, fmt: str, crs: str,
+) -> None:
+    """WMS 1.1.1 GetMap → decode PNG RGBA → wrap as georeferenced GeoTIFF."""
     w = chunk.width_px()
     h = chunk.height_px()
+    crs_param = "SRS" if wms_version.startswith("1.1") else "CRS"
     params = {
-        "service": "WCS",
-        "version": wcs_version,
-        "request": "GetCoverage",
-        "coverageId": coverage_id,
-        "format": "image/tiff",
-        "subset": [
-            f"{subset_axis_x}({chunk.minx},{chunk.maxx})",
-            f"{subset_axis_y}({chunk.miny},{chunk.maxy})",
-        ],
-        "subsettingcrs": "http://www.opengis.net/def/crs/EPSG/0/25832",
-        "outputcrs":    "http://www.opengis.net/def/crs/EPSG/0/25832",
-        # WCS 2.0 Scaling Extension (OGC 12-039): normally `ScaleSize`.
-        # Keep the key configurable because Task 0 verifies LDBV capabilities.
-        scale_size_param: [f"{size_axis_x}({w})", f"{size_axis_y}({h})"],
+        "SERVICE": "WMS",
+        "VERSION": wms_version,
+        "REQUEST": "GetMap",
+        "LAYERS": layer,
+        "STYLES": "",
+        crs_param: crs,
+        # WMS 1.1.1 EPSG:25832: X,Y (easting, northing) — same order as our chunk
+        "BBOX": f"{chunk.minx},{chunk.miny},{chunk.maxx},{chunk.maxy}",
+        "WIDTH": str(w),
+        "HEIGHT": str(h),
+        "FORMAT": fmt,
+        "TRANSPARENT": "TRUE",
     }
     try:
-        r = session.get(wcs_url, params=params, timeout=(10, 60))
+        r = session.get(wms_url, params=params, timeout=(10, 60))
         r.raise_for_status()
     except requests.exceptions.Timeout as e:
-        raise WCSError("WCS_TIMEOUT") from e
+        raise DopDownloadError("DOP_TIMEOUT") from e
     except requests.exceptions.RequestException as e:
-        raise WCSError("WCS_HTTP_ERROR") from e
-    out_path.write_bytes(r.content)
+        raise DopDownloadError("DOP_HTTP_ERROR") from e
+    if not r.headers.get("Content-Type", "").startswith("image/"):
+        # WMS ExceptionReport comes back as text/xml with HTTP 200
+        raise DopDownloadError(f"DOP_HTTP_ERROR: non-image response {r.text[:200]}")
+    arr = _png_bytes_to_array(r.content)
+    _write_geotiff(
+        out_path, arr,
+        bbox=(chunk.minx, chunk.miny, chunk.maxx, chunk.maxy),
+        crs=crs,
+    )
 
 def download_dop20(
     bbox_utm: tuple[float, float, float, float],
-    preset_center_margin_px: int, out_dir: Path,
-    *, wcs_url: str, coverage_id: str, max_pixels: int,
-    origin_x: float, origin_y: float,
-    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
-    scale_size_param: str,
-    size_axis_x: str, size_axis_y: str,
+    out_dir: Path,
+    *, wms_url: str, layer: str, wms_version: str, fmt: str, crs: str,
+    max_pixels: int, origin_x: float, origin_y: float,
 ) -> Path:
-    """Spec §5.1 signature. bbox_utm MUST be the already-prepared download_bbox."""
+    """Spec §5.1 signature. bbox_utm MUST be the already-prepared download_bbox.
+    Downloads the AOI as a set of WMS GetMap chunks, wraps each in GeoTIFF, and
+    combines them via gdal.BuildVRT for seamless downstream reading."""
     out_dir.mkdir(parents=True, exist_ok=True)
     chunks = plan_chunk_grid(
         *bbox_utm, max_pixels=max_pixels, step=STEP,
@@ -1456,33 +1524,30 @@ def download_dop20(
     for c in chunks:
         p = out_dir / f"chunk_{c.row}_{c.col}.tif"
         _fetch_chunk(
-            session, wcs_url, coverage_id, c, p,
-            wcs_version=wcs_version,
-            subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
-            scale_size_param=scale_size_param,
-            size_axis_x=size_axis_x, size_axis_y=size_axis_y,
+            session, wms_url, layer, c, p,
+            wms_version=wms_version, fmt=fmt, crs=crs,
         )
         chunk_files.append(str(p))
     vrt_path = out_dir / "out.vrt"
     vrt = gdal.BuildVRT(str(vrt_path), chunk_files)
     if vrt is None:
-        raise WCSError("VRT_BUILD_FAILED")
+        raise DopDownloadError("VRT_BUILD_FAILED")
     vrt.FlushCache()
     return vrt_path
 ```
 
-Note: `responses` fixture requires `pytest-responses` — replace with `responses.activate` decorator if needed. If `responses` cannot register params, use callback-based matcher. The alternative test technique is to replace `_fetch_chunk` with a monkeypatch'd stub; the plan permits either, as long as VRT output is verified.
+Note: `responses` fixture requires `pytest-responses` — replace with `responses.activate` decorator if needed. If `responses` cannot register params, use callback-based matcher. The alternative test technique is to replace `_fetch_chunk` with a monkeypatch'd stub; the plan permits either, as long as VRT output (with georeferenced RGBA GeoTIFF chunks) is verified.
 
 - [ ] **Step 4: Run tests**
 
-Run: `pytest tests/pipeline/test_wcs_client.py -v`
+Run: `pytest tests/pipeline/test_dop_client.py -v`
 Expected: all PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ki_geodaten/pipeline/wcs_client.py tests/pipeline/test_wcs_client.py
-git commit -m "feat(wcs): paginated chunk grid, HTTP retry, VRT build"
+git add ki_geodaten/pipeline/dop_client.py tests/pipeline/test_dop_client.py
+git commit -m "feat(dop): paginated WMS chunk grid, PNG→GeoTIFF wrap, VRT build"
 ```
 
 ---
@@ -3039,10 +3104,8 @@ def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):
     monkeypatch.setattr("ki_geodaten.worker.orchestrator.iter_tiles", fake_iter_tiles)
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
-            wcs_url="", coverage_id="", max_pixels=4000,
-            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-            scale_size_param="ScaleSize",
-            size_axis_x="E", size_axis_y="N",
+            wms_url="", layer="by_dop20c", max_pixels=6000,
+            wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -3070,10 +3133,8 @@ def test_orchestrator_records_oom_as_nodata(tmp_path, monkeypatch):
                         lambda *a, **kw: iter(tiles))
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
-            wcs_url="", coverage_id="", max_pixels=4000,
-            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-            scale_size_param="ScaleSize",
-            size_axis_x="E", size_axis_y="N",
+            wms_url="", layer="by_dop20c", max_pixels=6000,
+            wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -3092,10 +3153,8 @@ def test_orchestrator_records_inference_error_as_nodata(tmp_path, monkeypatch):
                         lambda *a, **kw: iter(tiles))
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
-            wcs_url="", coverage_id="", max_pixels=4000,
-            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-            scale_size_param="ScaleSize",
-            size_axis_x="E", size_axis_y="N",
+            wms_url="", layer="by_dop20c", max_pixels=6000,
+            wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -3112,10 +3171,8 @@ def test_orchestrator_records_nodata_tile_without_invoking_segmenter(tmp_path, m
                         lambda *a, **kw: iter(tiles))
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
-            wcs_url="", coverage_id="", max_pixels=4000,
-            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-            scale_size_param="ScaleSize",
-            size_axis_x="E", size_axis_y="N",
+            wms_url="", layer="by_dop20c", max_pixels=6000,
+            wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -3123,23 +3180,21 @@ def test_orchestrator_records_nodata_tile_without_invoking_segmenter(tmp_path, m
     assert nd[0]["reason"] == "NODATA_PIXELS"
 
 def test_orchestrator_catches_download_error_marks_failed(tmp_path, monkeypatch):
-    from ki_geodaten.pipeline.wcs_client import WCSError
+    from ki_geodaten.pipeline.dop_client import DopDownloadError
     db = _setup_job(tmp_path)
     def fail_download(*a, **kw):
-        raise WCSError("WCS_TIMEOUT")
+        raise DopDownloadError("DOP_TIMEOUT")
     monkeypatch.setattr("ki_geodaten.worker.orchestrator.download_dop20", fail_download)
 
     run_job(db, job_id="j1", segmenter=_StubSegmenter([]), data_root=tmp_path,
-            wcs_url="", coverage_id="", max_pixels=4000,
-            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-            scale_size_param="ScaleSize",
-            size_axis_x="E", size_axis_y="N",
+            wms_url="", layer="by_dop20c", max_pixels=6000,
+            wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
     job = get_job(db, "j1")
     assert job["status"] == JobStatus.FAILED
-    assert job["error_reason"] == "WCS_TIMEOUT"
+    assert job["error_reason"] == "DOP_TIMEOUT"
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -3166,7 +3221,7 @@ from ki_geodaten.jobs.store import (
     increment_tile_completed, increment_tile_failed,
 )
 from ki_geodaten.models import JobStatus, TilePreset, ErrorReason, NoDataReason
-from ki_geodaten.pipeline.wcs_client import download_dop20, WCSError
+from ki_geodaten.pipeline.dop_client import download_dop20, DopDownloadError
 from ki_geodaten.pipeline.tiler import (
     TileConfig, Tile, NodataTile, iter_tiles, safe_center_polygon,
 )
@@ -3235,10 +3290,8 @@ def _persist_safe_center_nodata(
 
 def run_job(
     db_path: Path, *, job_id: str, segmenter, data_root: Path,
-    wcs_url: str, coverage_id: str, max_pixels: int,
-    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
-    scale_size_param: str,
-    size_axis_x: str, size_axis_y: str,
+    wms_url: str, layer: str, max_pixels: int,
+    wms_version: str, fmt: str, crs: str,
     origin_x: float, origin_y: float, min_polygon_area_m2: float,
     safe_center_nodata_threshold: float,
 ) -> None:
@@ -3258,19 +3311,16 @@ def run_job(
         aoi_utm = tuple(json.loads(job["bbox_utm_snapped"]))
         # Download bbox = aoi + margin (caller had already prepared via prepare_download_bbox
         # when the job was created; we re-apply here for robustness).
-        from ki_geodaten.pipeline.wcs_client import prepare_download_bbox
+        from ki_geodaten.pipeline.dop_client import prepare_download_bbox
         prepared = prepare_download_bbox(
             *aoi_utm, preset=preset,
             origin_x=origin_x, origin_y=origin_y,
         )
         vrt_path = download_dop20(
-            prepared.download_bbox, preset_center_margin_px=cfg.center_margin,
-            out_dir=out_dir, wcs_url=wcs_url, coverage_id=coverage_id,
-            max_pixels=max_pixels, origin_x=origin_x, origin_y=origin_y,
-            wcs_version=wcs_version,
-            subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
-            scale_size_param=scale_size_param,
-            size_axis_x=size_axis_x, size_axis_y=size_axis_y,
+            prepared.download_bbox, out_dir=out_dir,
+            wms_url=wms_url, layer=layer, wms_version=wms_version,
+            fmt=fmt, crs=crs, max_pixels=max_pixels,
+            origin_x=origin_x, origin_y=origin_y,
         )
         update_status(db_path, job_id, JobStatus.INFERRING, dop_vrt_path=str(vrt_path))
 
@@ -3319,8 +3369,8 @@ def run_job(
 
         update_status(db_path, job_id, JobStatus.READY_FOR_REVIEW, set_finished=True)
 
-    except WCSError as exc:
-        reason = str(exc) if str(exc) in ("WCS_TIMEOUT", "WCS_HTTP_ERROR") else ErrorReason.WCS_HTTP_ERROR
+    except DopDownloadError as exc:
+        reason = str(exc) if str(exc) in ("DOP_TIMEOUT", "DOP_HTTP_ERROR") else ErrorReason.DOP_HTTP_ERROR
         update_status(
             db_path, job_id, JobStatus.FAILED,
             error_reason=str(reason), error_message=_traceback_tail(exc),
@@ -3420,10 +3470,8 @@ def test_run_forever_exits_after_max_jobs(tmp_path, monkeypatch):
     run_forever(
         db_path=db, data_root=tmp_path,
         segmenter_factory=lambda: _StubSegmenter(),
-        wcs_url="", coverage_id="", max_pixels=4000,
-        wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-        scale_size_param="ScaleSize",
-        size_axis_x="E", size_axis_y="N",
+        wms_url="", layer="by_dop20c", max_pixels=6000,
+        wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
         origin_x=0.0, origin_y=0.0,
         min_polygon_area_m2=1.0, safe_center_nodata_threshold=0.0,
         max_jobs=2, poll_interval=0.01, idle_exit_after=2,
@@ -3478,10 +3526,8 @@ def startup_cleanup(db_path: Path, *, data_root: Path) -> None:
 def run_forever(
     *, db_path: Path, data_root: Path,
     segmenter_factory: Callable[[], object],
-    wcs_url: str, coverage_id: str, max_pixels: int,
-    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
-    scale_size_param: str,
-    size_axis_x: str, size_axis_y: str,
+    wms_url: str, layer: str, max_pixels: int,
+    wms_version: str, fmt: str, crs: str,
     origin_x: float, origin_y: float,
     min_polygon_area_m2: float, safe_center_nodata_threshold: float,
     max_jobs: int, poll_interval: float,
@@ -3506,12 +3552,8 @@ def run_forever(
             run_job(
                 db_path, job_id=job["id"], segmenter=segmenter,
                 data_root=data_root,
-                wcs_url=wcs_url, coverage_id=coverage_id,
-                max_pixels=max_pixels,
-                wcs_version=wcs_version,
-                subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
-                scale_size_param=scale_size_param,
-                size_axis_x=size_axis_x, size_axis_y=size_axis_y,
+                wms_url=wms_url, layer=layer, max_pixels=max_pixels,
+                wms_version=wms_version, fmt=fmt, crs=crs,
                 origin_x=origin_x, origin_y=origin_y,
                 min_polygon_area_m2=min_polygon_area_m2,
                 safe_center_nodata_threshold=safe_center_nodata_threshold,
@@ -3534,15 +3576,11 @@ def main() -> None:   # pragma: no cover
             iou_threshold=settings.LOCAL_MASK_NMS_IOU,
             containment_ratio=settings.LOCAL_MASK_CONTAINMENT_RATIO,
         ),
-        wcs_url=settings.WCS_URL, coverage_id=settings.WCS_COVERAGE_ID,
-        max_pixels=settings.WCS_MAX_PIXELS,
-        wcs_version=settings.WCS_VERSION,
-        subset_axis_x=settings.WCS_SUBSET_AXIS_X,
-        subset_axis_y=settings.WCS_SUBSET_AXIS_Y,
-        scale_size_param=settings.WCS_SCALE_SIZE_PARAM,
-        size_axis_x=settings.WCS_SIZE_AXIS_X,
-        size_axis_y=settings.WCS_SIZE_AXIS_Y,
-        origin_x=settings.WCS_GRID_ORIGIN_X, origin_y=settings.WCS_GRID_ORIGIN_Y,
+        wms_url=settings.WMS_URL, layer=settings.WMS_LAYER,
+        max_pixels=settings.WMS_MAX_PIXELS,
+        wms_version=settings.WMS_VERSION,
+        fmt=settings.WMS_FORMAT, crs=settings.WMS_CRS,
+        origin_x=settings.WMS_GRID_ORIGIN_X, origin_y=settings.WMS_GRID_ORIGIN_Y,
         min_polygon_area_m2=settings.MIN_POLYGON_AREA_M2,
         safe_center_nodata_threshold=settings.SAFE_CENTER_NODATA_THRESHOLD,
         max_jobs=settings.MAX_JOBS_PER_WORKER,
@@ -3605,7 +3643,7 @@ def test_cleanup_deletes_old_failed_and_exported(tmp_path):
                    bbox_wgs84=[0,0,1,1], bbox_utm_snapped=[0,0,1,1],
                    tile_preset=TilePreset.MEDIUM)
     update_status(db, "old_failed", JobStatus.FAILED,
-                  error_reason="WCS_TIMEOUT", set_finished=True)
+                  error_reason="DOP_TIMEOUT", set_finished=True)
     update_status(db, "old_exported", JobStatus.EXPORTED, set_finished=True,
                   gpkg_path=str(results / "old_exported.gpkg"))
     (results / "old_exported.gpkg").write_bytes(b"gpkg")
@@ -3658,7 +3696,7 @@ def test_cleanup_batches_large_delete_set(tmp_path):
                    bbox_wgs84=[0,0,1,1], bbox_utm_snapped=[0,0,1,1],
                    tile_preset=TilePreset.MEDIUM)
         update_status(db, jid, JobStatus.FAILED,
-                      error_reason="WCS_TIMEOUT", set_finished=True)
+                      error_reason="DOP_TIMEOUT", set_finished=True)
         _set_finished_at(db, jid, old_when)
     deleted = cleanup_old_jobs(db, results_dir=results, retention_days=7)
     assert len(deleted) == 1050
@@ -4028,7 +4066,7 @@ from ki_geodaten.config import Settings
 from ki_geodaten.jobs.store import insert_job
 from ki_geodaten.models import CreateJobRequest, TilePreset
 from ki_geodaten.pipeline.geo_utils import transform_bbox_wgs84_to_utm
-from ki_geodaten.pipeline.wcs_client import prepare_download_bbox
+from ki_geodaten.pipeline.dop_client import prepare_download_bbox
 
 router = APIRouter()
 
@@ -4084,7 +4122,7 @@ async def create_job(req: CreateJobRequest, request: Request):
     utm_bounds = transform_bbox_wgs84_to_utm(*bbox)
     prepared = prepare_download_bbox(
         *utm_bounds, preset=req.tile_preset,
-        origin_x=settings.WCS_GRID_ORIGIN_X, origin_y=settings.WCS_GRID_ORIGIN_Y,
+        origin_x=settings.WMS_GRID_ORIGIN_X, origin_y=settings.WMS_GRID_ORIGIN_Y,
     )
 
     job_id = str(uuid.uuid4())
@@ -5177,9 +5215,9 @@ git commit -m "chore: add run-server.sh and run-worker.sh supervisor scripts"
 **Files:**
 - Create: `tests/test_end_to_end.py`
 
-**See Spec §11 End-to-End** — mini GeoTIFF fixture, mock WCS, stub segmenter returning fixed mask; verify the pipeline runs POST→WORKER→EXPORT and produces a valid two-layer GPKG.
+**See Spec §11 End-to-End** — mini GeoTIFF fixture, mock WMS download, stub segmenter returning fixed mask; verify the pipeline runs POST→WORKER→EXPORT and produces a valid two-layer GPKG.
 
-This test exercises the full worker + API together, using monkeypatches to replace the real segmenter and WCS.
+This test exercises the full worker + API together, using monkeypatches to replace the real segmenter and the `download_dop20` WMS download.
 
 - [ ] **Step 1: Write test**
 
@@ -5233,7 +5271,7 @@ def test_end_to_end(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     # Monkeypatch download_dop20 to synthesise a VRT on disk instead of HTTP
-    def fake_download(bbox_utm, preset_center_margin_px, out_dir, **kwargs):
+    def fake_download(bbox_utm, *, out_dir, **kwargs):
         out_dir.mkdir(parents=True, exist_ok=True)
         vrt = out_dir / "out.vrt"
         _make_vrt(vrt, bbox_utm)
@@ -5259,10 +5297,8 @@ def test_end_to_end(tmp_path, monkeypatch):
         run_forever(
             db_path=app.state.db_path, data_root=app.state.data_root,
             segmenter_factory=_StubSegmenter,
-            wcs_url="", coverage_id="", max_pixels=4000,
-            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
-            scale_size_param="ScaleSize",
-            size_axis_x="E", size_axis_y="N",
+            wms_url="", layer="by_dop20c", max_pixels=6000,
+            wms_version="1.1.1", fmt="image/png", crs="EPSG:25832",
             origin_x=0.0, origin_y=0.0,
             min_polygon_area_m2=0.01, safe_center_nodata_threshold=0.0,
             max_jobs=1, poll_interval=0.01, idle_exit_after=1,
@@ -5311,7 +5347,7 @@ git commit -m "test: end-to-end integration across API and worker"
 **Files:**
 - Create: `README.md`
 
-Goal: document local setup, how to install `sam3` and `gdal` (the two non-pip deps), how to run server and worker, and how to point at a real LDBV WCS.
+Goal: document local setup, how to install `sam3` and `gdal` (the two non-pip deps), how to run server and worker, and how to point at the LDBV OpenData WMS.
 
 - [ ] **Step 1: Write `README.md`**
 
@@ -5345,24 +5381,20 @@ Download the SAM 3.1 checkpoint into `models/sam3.1_hiera_large.pt`.
 
 ## Configure
 
-Copy `.env.example` → `.env`, fill in verified values:
+Copy `.env.example` → `.env`. The defaults already point at the LDBV OpenData WMS (no auth, CC BY 4.0):
 
 ```
-WCS_URL=https://geoservices.bayern.de/wcs/v2/dop20
-WCS_COVERAGE_ID=by_dop20rgb
-WCS_VERSION=2.0.1
-WCS_GRID_ORIGIN_X=<from GetCapabilities>
-WCS_GRID_ORIGIN_Y=<from GetCapabilities>
-WCS_SUBSET_AXIS_X=<from GetCapabilities, e.g. E>
-WCS_SUBSET_AXIS_Y=<from GetCapabilities, e.g. N>
-WCS_SCALE_SIZE_PARAM=ScaleSize
-WCS_SIZE_AXIS_X=<from GetCapabilities, e.g. E>
-WCS_SIZE_AXIS_Y=<from GetCapabilities, e.g. N>
+WMS_URL=https://geoservices.bayern.de/od/wms/dop/v1/dop20
+WMS_LAYER=by_dop20c
+WMS_VERSION=1.1.1
+WMS_FORMAT=image/png
+WMS_CRS=EPSG:25832
+WMS_MAX_PIXELS=6000
 ```
 
-**Before first run:** complete Task 0 / `docs/wcs-verification.md` and verify
-WCS axis order, origin, and max pixel count via `GetCapabilities` /
-`DescribeCoverage` (Spec §15).
+**Before first run:** complete Task 0 / `docs/wms-verification.md` and run the
+adjacent-chunk edge test to verify the WMS samples its source raster
+consistently across BBox boundaries.
 
 ## Run
 
@@ -5393,7 +5425,7 @@ test needs `gdal.BuildVRT`, which is provided by the conda-installed GDAL.
 
 ## Known limits
 
-- Only Bayern (LDBV WCS-specific).
+- Only Bayern (LDBV OpenData WMS for DOP20).
 - 1 km² max AOI (see Spec §9.1).
 - `tile_preset` selects max object diameter: 64 m / 128 m / 192 m.
 - Large preset is not interactive (~1 h per 1 km²).
@@ -5416,7 +5448,7 @@ Before marking the plan done, verify:
 - [ ] Every Spec section §5.1–§12 has at least one implementing task.
 - [ ] `validation_revision` is written ONLY by `validate_bulk`; never by export.
 - [ ] `exported_revision` is written ONLY by the export endpoint.
-- [ ] Task 0 WCS verification is complete and `config.py` WCS defaults match `docs/wcs-verification.md`.
+- [ ] Task 0 WMS verification is complete (PNG RGBA confirmed + adjacent-chunk edge test passed) and `config.py` WMS defaults match `docs/wms-verification.md`.
 - [ ] `nodata_regions.geometry_wkb` always stores the **safe-center** polygon (size-2·margin), never the full tile.
 - [ ] `bbox_utm_snapped` is the unexpanded user AOI; the download bbox is only used at download time.
 - [ ] GeoJSON responses and GPKG are both clipped to `bbox_utm_snapped` (Clip-Window-Semantik).
@@ -5444,7 +5476,8 @@ Before marking the plan done, verify:
 - [ ] Orchestrator iterates tiles lazily (`for tile in iter_tiles(...)`) and obtains `tile_total` via a cheap `iter_grid(src, cfg)` count — never materializes all tiles in memory.
 - [ ] Geojson route uses `functools.partial`, not a lambda, when submitting to `ProcessPoolExecutor` (lambdas are not picklable).
 - [ ] Geojson ProcessPool functions return finished JSON strings; FastAPI routes return `Response(content=..., media_type="application/json")` and do not serialize large dicts on the event loop.
-- [ ] WCS GetCoverage uses the verified WCS 2.0 scaling parameter name (`ScaleSize` by default), not an unverified `size` KVP.
+- [ ] WMS GetMap uses `SRS=` (1.1.1) not `CRS=` (1.3.0); BBOX axis order matches the negotiated WMS version (1.1.1 + EPSG:25832 → X,Y).
+- [ ] WMS PNG response is decoded as RGBA and wrapped into a 4-band GeoTIFF with `colorinterp=(red,green,blue,alpha)` so `dataset_mask()` returns the alpha channel for NoData detection.
 - [ ] Export route unpickles via module-level `update_status` import (no in-function `from ... import ... as _us` shadowing).
 - [ ] `_job_view` returns `bbox_wgs84` as a parsed **array**, not a JSON string.
 - [ ] Frontend styles polygons via native Leaflet `style` options (color / fillColor / dashArray), NOT CSS classes — `L.canvas()` ignores per-feature className.
