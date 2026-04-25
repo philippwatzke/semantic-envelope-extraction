@@ -129,3 +129,123 @@ def update_status(
     params.append(job_id)
     with connect(db_path) as conn:
         conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = ?", params)
+
+def insert_polygons(db_path: Path, job_id: str, polys: list[dict]) -> None:
+    if not polys:
+        return
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        conn.executemany(
+            "INSERT INTO polygons(job_id,geometry_wkb,score,source_tile_row,source_tile_col)"
+            " VALUES (?,?,?,?,?)",
+            [(job_id, p["geometry_wkb"], p["score"],
+              p["source_tile_row"], p["source_tile_col"]) for p in polys],
+        )
+        conn.execute("COMMIT")
+
+def insert_nodata_region(
+    db_path: Path, job_id: str, *, geometry_wkb: bytes,
+    tile_row: int, tile_col: int, reason: str,
+) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO nodata_regions(job_id,geometry_wkb,tile_row,tile_col,reason)"
+            " VALUES (?,?,?,?,?)",
+            (job_id, geometry_wkb, tile_row, tile_col, reason),
+        )
+
+def increment_tile_completed(db_path: Path, job_id: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET tile_completed = tile_completed + 1 WHERE id = ?",
+            (job_id,),
+        )
+
+def increment_tile_failed(db_path: Path, job_id: str) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET tile_failed = tile_failed + 1 WHERE id = ?",
+            (job_id,),
+        )
+
+def get_polygons_for_job(db_path: Path, job_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id,geometry_wkb,score,source_tile_row,source_tile_col,validation"
+            " FROM polygons WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def get_nodata_for_job(db_path: Path, job_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id,geometry_wkb,tile_row,tile_col,reason"
+            " FROM nodata_regions WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def validate_bulk(db_path: Path, job_id: str, updates: list[dict]) -> int:
+    """executemany-based bulk update per Spec §8. Increments validation_revision.
+
+    Note: we rely on sqlite3.Cursor.rowcount being cumulative across an
+    executemany() call — this is only guaranteed on Python 3.12+. The
+    pyproject.toml requires-python setting enforces that; do NOT downgrade.
+    """
+    if not updates:
+        return 0
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        cur = conn.cursor()
+        cur.executemany(
+            "UPDATE polygons SET validation = ? WHERE id = ? AND job_id = ?",
+            [(u["validation"], u["pid"], job_id) for u in updates],
+        )
+        updated = cur.rowcount
+        conn.execute(
+            "UPDATE jobs SET validation_revision = validation_revision + 1 WHERE id = ?",
+            (job_id,),
+        )
+        conn.execute("COMMIT")
+    return max(updated, 0)
+
+def list_jobs(db_path: Path) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def claim_next_pending_job(db_path: Path) -> dict | None:
+    """Atomic PENDING→DOWNLOADING claim."""
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE status='PENDING' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.execute("COMMIT")
+            return None
+        conn.execute(
+            "UPDATE jobs SET status='DOWNLOADING', started_at=? WHERE id=?",
+            (_utc_iso(), row["id"]),
+        )
+        conn.execute("COMMIT")
+    return dict(row)
+
+def abort_incomplete_jobs_on_startup(db_path: Path) -> list[str]:
+    """Per Spec §10.3 — mark DOWNLOADING/INFERRING as FAILED(WORKER_RESTARTED)."""
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE status IN ('DOWNLOADING','INFERRING')"
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        conn.execute(
+            "UPDATE jobs SET status='FAILED', error_reason='WORKER_RESTARTED', finished_at=?"
+            " WHERE status IN ('DOWNLOADING','INFERRING')",
+            (_utc_iso(),),
+        )
+        conn.execute("COMMIT")
+    return ids

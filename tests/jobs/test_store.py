@@ -67,3 +67,77 @@ def test_cascade_delete(tmp_path):
         conn.commit()
         n = conn.execute("SELECT COUNT(*) FROM polygons").fetchone()[0]
     assert n == 0
+
+from ki_geodaten.jobs.store import (
+    insert_polygons, insert_nodata_region, increment_tile_completed,
+    increment_tile_failed, get_polygons_for_job, get_nodata_for_job,
+    validate_bulk,
+)
+
+def test_insert_polygons_and_fetch(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    insert_polygons(db, jid, [
+        {"geometry_wkb": b"\x01\x02", "score": 0.9, "source_tile_row": 0, "source_tile_col": 0},
+        {"geometry_wkb": b"\x03\x04", "score": 0.5, "source_tile_row": 0, "source_tile_col": 1},
+    ])
+    rows = get_polygons_for_job(db, jid)
+    assert len(rows) == 2
+    assert all(r["validation"] == "ACCEPTED" for r in rows)
+
+def test_validate_bulk_updates_revision_and_ignores_unknown_pids(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    insert_polygons(db, jid, [
+        {"geometry_wkb": b"a", "score": 0.9, "source_tile_row": 0, "source_tile_col": 0},
+        {"geometry_wkb": b"b", "score": 0.8, "source_tile_row": 0, "source_tile_col": 1},
+    ])
+    updates = [{"pid": 1, "validation": "REJECTED"}, {"pid": 9999, "validation": "REJECTED"}]
+    updated = validate_bulk(db, jid, updates)
+    assert updated == 1
+    job = get_job(db, jid)
+    assert job["validation_revision"] == 1
+
+def test_validate_bulk_handles_many_updates(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    insert_polygons(db, jid, [
+        {"geometry_wkb": b"x", "score": 0.1, "source_tile_row": 0, "source_tile_col": 0}
+        for _ in range(1500)
+    ])
+    updates = [{"pid": i + 1, "validation": "REJECTED"} for i in range(1500)]
+    updated = validate_bulk(db, jid, updates)
+    assert updated == 1500
+
+def test_increment_tile_completed(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    increment_tile_completed(db, jid)
+    increment_tile_completed(db, jid)
+    increment_tile_failed(db, jid)
+    job = get_job(db, jid)
+    assert job["tile_completed"] == 2
+    assert job["tile_failed"] == 1
+
+def test_insert_nodata_region(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    insert_nodata_region(db, jid, geometry_wkb=b"\x00", tile_row=1, tile_col=2, reason="OOM")
+    rows = get_nodata_for_job(db, jid)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "OOM"
